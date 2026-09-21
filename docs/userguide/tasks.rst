@@ -326,12 +326,12 @@ The request defines the following attributes:
            the client, not by a worker.
 
 :eta: The original ETA of the task (if any).
-      This is in UTC time (depending on the :setting:`enable_utc`
-      setting).
+      This is an aware datetime representing an absolute instant, displayed
+      in the worker's configured timezone.
 
 :expires: The original expiry time of the task (if any).
-          This is in UTC time (depending on the :setting:`enable_utc`
-          setting).
+          This is an aware datetime representing an absolute instant,
+          displayed in the worker's configured timezone.
 
 :hostname: Node name of the worker instance executing the task.
 
@@ -371,7 +371,8 @@ The request defines the following attributes:
 
 :errbacks: A list of signatures to be called if this task fails.
 
-:utc: Set to true the caller has UTC enabled (:setting:`enable_utc`).
+:utc: Protocol 1 compatibility flag that controls interpretation of naive
+      timestamps that have no explicit offset.
 
 
 .. versionadded:: 3.1

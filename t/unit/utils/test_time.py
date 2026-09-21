@@ -13,7 +13,8 @@ else:
 
 from celery.utils.iso8601 import parse_iso8601
 from celery.utils.time import (LocalTimezone, _is_imaginary, delta_resolution, ffwd,
-                               get_exponential_backoff_interval, humanize_seconds, localize, make_aware,
+                               deadline_from_now, get_exponential_backoff_interval,
+                               humanize_seconds, localize, make_aware,
                                maybe_iso8601, maybe_make_aware, maybe_timedelta, rate, remaining, timezone,
                                utcoffset)
 
@@ -268,6 +269,15 @@ class test_make_aware:
         assert wtz == datetime(2024, 3, 10, 3, 30, tzinfo=tz)
         assert wtz.utcoffset().total_seconds() == -4 * 60 * 60
 
+    def test_repeated_wall_time_uses_first_occurrence(self):
+        tz = ZoneInfo('America/New_York')
+        wtz = make_aware(datetime(2026, 11, 1, 1, 30), tz)
+
+        assert wtz.fold == 0
+        assert wtz.astimezone(_timezone.utc) == datetime(
+            2026, 11, 1, 5, 30, tzinfo=_timezone.utc)
+        assert wtz.utcoffset() == timedelta(hours=-4)
+
     def test_imaginary_detection_ignores_unsupported_timezones(self):
         assert not _is_imaginary(datetime.now(_timezone.utc), tzinfo())
 
@@ -292,6 +302,40 @@ class test_make_aware:
         assert maybe_make_aware(eastern).tzinfo is tz
         utcnow = datetime.now()
         assert maybe_make_aware(utcnow, 'UTC').tzinfo is ZoneInfo("UTC")
+
+    def test_naive_datetime_uses_configured_timezone(self):
+        tz = ZoneInfo('America/New_York')
+        value = datetime(2026, 3, 8, 1, 30)
+
+        aware = maybe_make_aware(value, tz, naive_as_utc=False)
+
+        assert aware == datetime(2026, 3, 8, 1, 30, tzinfo=tz)
+        assert aware.utcoffset() == timedelta(hours=-5)
+
+    def test_aware_gap_keeps_absolute_instant(self):
+        tz = ZoneInfo('America/New_York')
+        value = datetime(2026, 3, 8, 2, 30, tzinfo=tz)
+
+        aware = maybe_make_aware(value, tz)
+
+        assert aware == datetime(2026, 3, 8, 3, 30, tzinfo=tz)
+        assert aware.timestamp() == value.timestamp()
+
+    def test_deadline_uses_elapsed_time_through_spring_gap(self):
+        tz = ZoneInfo('America/New_York')
+        now = datetime(2026, 3, 8, 1, 30, tzinfo=tz)
+
+        deadline = deadline_from_now(3600, now, tz)
+
+        assert deadline == datetime(2026, 3, 8, 3, 30, tzinfo=tz)
+
+    def test_deadline_uses_elapsed_time_through_fold(self):
+        tz = ZoneInfo('America/New_York')
+        now = datetime(2026, 11, 1, 1, 30, tzinfo=tz)
+
+        deadline = deadline_from_now(3600, now, tz)
+
+        assert deadline == datetime(2026, 11, 1, 1, 30, tzinfo=tz, fold=1)
 
 
 class test_localize:

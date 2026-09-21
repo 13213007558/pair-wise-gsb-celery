@@ -3,10 +3,11 @@ from unittest.mock import Mock, patch
 
 import pytest
 from kombu import Exchange, Queue
+from zoneinfo import ZoneInfo
 
 from celery import uuid
 from celery.app.amqp import Queues, utf8dict
-from celery.utils.time import to_utc
+from celery.utils.time import deadline_from_now, to_utc
 
 
 class test_TaskConsumer:
@@ -553,6 +554,90 @@ class test_as_task_v2(test_AMQP_Base):
         )
         assert m.headers['expires'] == (
             now + timedelta(seconds=30)).isoformat()
+
+    @pytest.mark.parametrize(('transition', 'expected_local', 'expected_utc'), [
+        ('gap', '2026-03-08T03:30:00-04:00', '2026-03-08T07:30:00+00:00'),
+        ('fold', '2026-11-01T01:30:00-05:00', '2026-11-01T06:30:00+00:00'),
+    ])
+    def test_countdown_preserves_absolute_instant_across_dst(self, transition, expected_local, expected_utc):
+        tz = ZoneInfo('America/New_York')
+        self.app.conf.enable_utc = False
+        self.app.conf.timezone = 'America/New_York'
+        del self.app.timezone
+        if transition == 'gap':
+            now = datetime(2026, 3, 8, 1, 30, tzinfo=tz)
+        else:
+            now = datetime(2026, 11, 1, 1, 30, tzinfo=tz)
+
+        eta_message = self.app.amqp.as_task_v2(
+            uuid(), 'foo', countdown=3600, now=now,
+        ).headers['eta']
+        expires_message = self.app.amqp.as_task_v2(
+            uuid(), 'foo', expires=3600, now=now,
+        ).headers['expires']
+
+        assert eta_message == expected_local
+        assert expires_message == expected_local
+        eta = datetime.fromisoformat(eta_message)
+        expires = datetime.fromisoformat(expires_message)
+        assert eta.astimezone(timezone.utc).isoformat() == expected_utc
+        assert expires.astimezone(timezone.utc).isoformat() == expected_utc
+        assert (eta - now.astimezone(timezone.utc)).total_seconds() == 3600
+
+    def test_naive_eta_and_expires_use_configured_timezone(self):
+        self.app.conf.enable_utc = False
+        self.app.conf.timezone = 'America/New_York'
+        del self.app.timezone
+        naive = datetime(2026, 3, 8, 1, 30)
+
+        message = self.app.amqp.as_task_v2(uuid(), 'foo', eta=naive, expires=naive)
+
+        eta = datetime.fromisoformat(message.headers['eta'])
+        expires = datetime.fromisoformat(message.headers['expires'])
+        expected = naive.replace(tzinfo=ZoneInfo('America/New_York'))
+        assert eta.timestamp() == expected.timestamp()
+        assert expires.timestamp() == expected.timestamp()
+
+    def test_aware_gap_eta_preserves_offset_and_fold_instant(self):
+        tz = ZoneInfo('America/New_York')
+        eta = datetime(2026, 3, 8, 2, 30, tzinfo=tz)
+
+        message = self.app.amqp.as_task_v2(uuid(), 'foo', eta=eta)
+
+        encoded = datetime.fromisoformat(message.headers['eta'])
+        assert encoded.timestamp() == eta.timestamp()
+        assert encoded.astimezone(timezone.utc).isoformat() == '2026-03-08T07:30:00+00:00'
+
+    def test_broker_expiration_is_absolute_delay_across_dst(self):
+        tz = ZoneInfo('America/New_York')
+        now = datetime(2026, 3, 8, 1, 30, tzinfo=tz)
+        expires = datetime(2026, 3, 8, 3, 30).replace(tzinfo=tz)
+
+        assert self.app.deadline_delay(expires, now) == 3600
+
+    def test_deadline_from_now_matches_countdown(self):
+        tz = ZoneInfo('America/New_York')
+        now = datetime(2026, 11, 1, 1, 30, tzinfo=tz)
+        expected = deadline_from_now(3600, now, tz)
+
+        message = self.app.amqp.as_task_v2(
+            uuid(), 'foo', countdown=3600, now=now,
+        )
+
+        assert datetime.fromisoformat(message.headers['eta']).timestamp() == expected.timestamp()
+
+    def test_retry_countdown_uses_same_message_deadline(self):
+        tz = ZoneInfo('America/New_York')
+        now = datetime(2026, 3, 8, 1, 30, tzinfo=tz)
+
+        message = self.app.amqp.as_task_v2(
+            uuid(), 'foo', countdown=3600, now=now,
+        )
+        retry_message = self.app.amqp.as_task_v2(
+            uuid(), 'foo', countdown=3600, now=now,
+        )
+
+        assert retry_message.headers['eta'] == message.headers['eta']
 
     def test_eta_to_datetime(self):
         eta = datetime.now(timezone.utc)

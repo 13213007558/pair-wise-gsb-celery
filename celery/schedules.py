@@ -86,7 +86,7 @@ class BaseSchedule:
         raise NotImplementedError()
 
     def maybe_make_aware(
-            self, dt: datetime, naive_as_utc: bool = True) -> datetime:
+            self, dt: datetime, naive_as_utc: bool = False) -> datetime:
         return maybe_make_aware(dt, self.tz, naive_as_utc=naive_as_utc)
 
     @property
@@ -860,7 +860,7 @@ class solar(BaseSchedule):
                 self.cal.next_antitransit(self.ephem.Sun()) +
                 timedelta(minutes=1)
             )
-        next = self.maybe_make_aware(next_utc.datetime())
+        next = self.maybe_make_aware(next_utc.datetime(), naive_as_utc=True)
         now = self.maybe_make_aware(self.now())
         delta = next - now
         return delta

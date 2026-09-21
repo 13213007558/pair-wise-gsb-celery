@@ -1041,9 +1041,8 @@ class Celery:
 
                 if exchange_type != 'direct':
                     if eta:
-                        if isinstance(eta, str):
-                            eta = isoparse(eta)
-                        countdown = (maybe_make_aware(eta) - self.now()).total_seconds()
+                        eta = self.prepare_task_datetime(eta)
+                        countdown = self.deadline_delay(eta)
 
                     if countdown:
                         if countdown > 0:
@@ -1066,11 +1065,9 @@ class Celery:
 
         if expires is not None:
             if isinstance(expires, datetime):
-                expires_s = (maybe_make_aware(
-                    expires) - self.now()).total_seconds()
+                expires_s = self.deadline_delay(expires)
             elif isinstance(expires, str):
-                expires_s = (maybe_make_aware(
-                    isoparse(expires)) - self.now()).total_seconds()
+                expires_s = self.deadline_delay(isoparse(expires))
             else:
                 expires_s = expires
 
@@ -1297,6 +1294,25 @@ class Celery:
         """Return the current time and date as a datetime."""
         now_in_utc = to_utc(datetime.now(datetime_timezone.utc))
         return now_in_utc.astimezone(self.timezone)
+
+    def prepare_task_datetime(self, value, naive_as_utc=False):
+        """Interpret an ETA/expiration value as an absolute datetime."""
+
+        if value is None or isinstance(value, datetime):
+            dt = value
+        else:
+            dt = isoparse(value)
+        if dt is None:
+            return None
+        return maybe_make_aware(dt, self.timezone, naive_as_utc=naive_as_utc)
+
+    def deadline_delay(self, deadline, now=None):
+        """Return elapsed seconds until an absolute deadline."""
+
+        deadline = self.prepare_task_datetime(deadline)
+        now = now or self.now()
+        return (deadline.astimezone(timezone.utc) -
+                now.astimezone(timezone.utc)).total_seconds()
 
     def select_queues(self, queues=None):
         """Select subset of queues.

@@ -124,6 +124,31 @@ class test_schedule:
         s2 = fun(*args)
         assert s1 == s2
 
+    @pytest.mark.parametrize(('start', 'seconds'), [
+        (datetime(2026, 3, 8, 1, 30, tzinfo=ZoneInfo('America/New_York')), 3600),
+        (datetime(2026, 11, 1, 1, 30, fold=0, tzinfo=ZoneInfo('America/New_York')), 3600),
+    ])
+    def test_interval_uses_elapsed_time_across_dst(self, start, seconds):
+        self.app.conf.timezone = 'America/New_York'
+        del self.app.timezone
+        interval = schedule(
+            timedelta(seconds=seconds), app=self.app, nowfun=lambda: start)
+
+        assert interval.remaining_estimate(start) == timedelta(seconds=seconds)
+
+    @pytest.mark.parametrize(('naive_run', 'expected_utc'), [
+        (datetime(2026, 3, 8, 1, 30), datetime(2026, 3, 8, 6, 30, tzinfo=timezone.utc)),
+        (datetime(2026, 11, 1, 1, 30), datetime(2026, 11, 1, 5, 30, tzinfo=timezone.utc)),
+    ])
+    def test_naive_schedule_uses_configured_timezone(self, naive_run, expected_utc):
+        self.app.conf.timezone = 'America/New_York'
+        del self.app.timezone
+        interval = schedule(timedelta(hours=1), app=self.app)
+
+        aware = interval.maybe_make_aware(naive_run)
+
+        assert aware.astimezone(timezone.utc) == expected_utc
+
 
 # Module-level helper used as crontab(nowfun=...) in pickling tests.
 # Defined at top level so it is picklable/serializable.

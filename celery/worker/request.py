@@ -5,7 +5,7 @@ how tasks are executed.
 """
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timezone as datetime_timezone
 from time import monotonic, time
 from weakref import ref
 
@@ -53,8 +53,6 @@ def __optimize__():
 
 __optimize__()
 
-# Localize
-tz_or_local = timezone.tz_or_local
 send_revoked = signals.task_revoked.send
 send_retry = signals.task_retry.send
 
@@ -136,8 +134,8 @@ class Request:
             ignore_result = self._task.ignore_result
         self._ignore_result = ignore_result
 
-        # timezone means the message is timezone-aware, and the only timezone
-        # supported at this point is UTC.
+        # Protocol 2 timestamps carry an explicit offset. Protocol 1 uses the
+        # message's utc flag to interpret legacy naive timestamps.
         eta = self._request_dict.get('eta')
         if eta is not None:
             try:
@@ -145,7 +143,7 @@ class Request:
             except (AttributeError, ValueError, TypeError) as exc:
                 raise InvalidTaskError(
                     f'invalid ETA value {eta!r}: {exc}')
-            self._eta = maybe_make_aware(eta, self.tzlocal)
+            self._eta = self._make_message_datetime_aware(eta)
         else:
             self._eta = None
 
@@ -156,7 +154,7 @@ class Request:
             except (AttributeError, ValueError, TypeError) as exc:
                 raise InvalidTaskError(
                     f'invalid expires value {expires!r}: {exc}')
-            self._expires = maybe_make_aware(expires, self.tzlocal)
+            self._expires = self._make_message_datetime_aware(expires)
         else:
             self._expires = None
 
@@ -291,8 +289,14 @@ class Request:
     @property
     def tzlocal(self):
         if self._tzlocal is None:
-            self._tzlocal = self._app.conf.timezone
+            self._tzlocal = self._app.timezone
         return self._tzlocal
+
+    def _make_message_datetime_aware(self, value):
+        """Interpret a message timestamp and display it in app timezone."""
+
+        aware = maybe_make_aware(value, self.tzlocal, naive_as_utc=self._utc)
+        return aware.astimezone(self.tzlocal)
 
     @property
     def store_errors(self):
@@ -414,8 +418,8 @@ class Request:
     def maybe_expire(self):
         """If expired, mark the task as revoked."""
         if self.expires:
-            now = datetime.now(self.expires.tzinfo)
-            if now > self.expires:
+            now = datetime.now(datetime_timezone.utc)
+            if now > self.expires.astimezone(timezone.utc):
                 revoked_tasks.add(self.id)
                 return True
 

@@ -2,7 +2,6 @@
 import numbers
 from collections import namedtuple
 from collections.abc import Mapping
-from datetime import timedelta
 from weakref import WeakValueDictionary
 
 from kombu import Connection, Consumer, Exchange, Producer, Queue, pools
@@ -14,7 +13,7 @@ from celery import signals
 from celery.utils.nodenames import anon_nodename
 from celery.utils.saferepr import saferepr
 from celery.utils.text import indent as textindent
-from celery.utils.time import maybe_make_aware
+from celery.utils.time import deadline_from_now, maybe_make_aware
 
 from . import routes as _routes
 
@@ -344,16 +343,14 @@ class AMQP:
             self._verify_seconds(countdown, 'countdown')
             now = now or self.app.now()
             timezone = timezone or self.app.timezone
-            eta = maybe_make_aware(
-                now + timedelta(seconds=countdown), tz=timezone,
-            )
+            eta = deadline_from_now(countdown, now, timezone)
         if isinstance(expires, numbers.Real):
             self._verify_seconds(expires, 'expires')
             now = now or self.app.now()
             timezone = timezone or self.app.timezone
-            expires = maybe_make_aware(
-                now + timedelta(seconds=expires), tz=timezone,
-            )
+            expires = deadline_from_now(expires, now, timezone)
+        eta = eta and self.app.prepare_task_datetime(eta)
+        expires = expires and self.app.prepare_task_datetime(expires)
         if not isinstance(eta, str):
             eta = eta and eta.isoformat()
         # If we retry a task `expires` will already be ISO8601-formatted.
@@ -436,11 +433,17 @@ class AMQP:
         if countdown:  # convert countdown to ETA
             self._verify_seconds(countdown, 'countdown')
             now = now or self.app.now()
-            eta = now + timedelta(seconds=countdown)
+            eta = deadline_from_now(countdown, now, self.app.timezone)
         if isinstance(expires, numbers.Real):
             self._verify_seconds(expires, 'expires')
             now = now or self.app.now()
-            expires = now + timedelta(seconds=expires)
+            expires = deadline_from_now(expires, now, self.app.timezone)
+        eta = eta and maybe_make_aware(
+            eta, self.app.timezone if not self.utc else None,
+            naive_as_utc=self.utc)
+        expires = expires and maybe_make_aware(
+            expires, self.app.timezone if not self.utc else None,
+            naive_as_utc=self.utc)
         eta = eta and eta.isoformat()
         expires = expires and expires.isoformat()
 

@@ -10,6 +10,7 @@ import pytest
 from billiard.einfo import ExceptionInfo
 from kombu.utils.encoding import from_utf8, safe_repr, safe_str
 from kombu.utils.uuid import uuid
+from zoneinfo import ZoneInfo
 
 from celery import states
 from celery.app.trace import (TraceInfo, build_tracer, fast_trace_task, mro_lookup, reset_worker_optimizations,
@@ -256,6 +257,80 @@ class test_Request(RequestCase):
     def test_invalid_expires_raises_InvalidTaskError(self):
         with pytest.raises(InvalidTaskError):
             self.get_request(self.add.s(2, 2).set(expires='12345'))
+
+    def test_message_eta_offset_preserves_second_fold_instant(self):
+        self.app.conf.enable_utc = False
+        self.app.conf.timezone = 'America/New_York'
+        del self.app.timezone
+        req = self.xRequest(eta='2026-11-01T01:30:00-05:00')
+
+        assert req.eta.timestamp() == datetime.fromisoformat(
+            '2026-11-01T06:30:00+00:00').timestamp()
+        assert req.eta.isoformat() == '2026-11-01T01:30:00-05:00'
+        assert req.eta.fold == 1
+
+    def test_message_eta_offset_preserves_absolute_instant_in_gap(self):
+        self.app.conf.enable_utc = False
+        self.app.conf.timezone = 'America/New_York'
+        del self.app.timezone
+        req = self.xRequest(eta='2026-03-08T02:30:00-05:00')
+
+        assert req.eta.timestamp() == datetime.fromisoformat(
+            '2026-03-08T07:30:00+00:00').timestamp()
+        assert req.eta.isoformat() == '2026-03-08T03:30:00-04:00'
+
+    def test_legacy_naive_message_uses_utc_flag_for_fold(self):
+        self.app.conf.enable_utc = False
+        self.app.conf.timezone = 'America/New_York'
+        del self.app.timezone
+        message = Mock(name='proto1-message')
+        message.headers = {}
+        payload = {
+            'task': self.mytask.name, 'id': uuid(),
+            'args': (1,), 'kwargs': {},
+            'eta': '2026-11-01T01:30:00',
+            'expires': '2026-11-01T01:30:00', 'utc': False,
+            'timelimit': (None, None),
+        }
+        message.payload = payload
+        req = Request(message, app=self.app, headers=payload,
+                      body=(1, {}, {}), decoded=True, utc=False)
+
+        expected_timestamp = datetime.fromisoformat(
+            '2026-11-01T05:30:00+00:00').timestamp()
+        assert req.eta.timestamp() == expected_timestamp
+        assert req.expires.timestamp() == expected_timestamp
+        assert req.eta.isoformat() == '2026-11-01T01:30:00-04:00'
+
+    def test_legacy_naive_message_utc_true_stays_utc_at_fold(self):
+        self.app.conf.enable_utc = False
+        self.app.conf.timezone = 'America/New_York'
+        del self.app.timezone
+        message = Mock(name='proto1-message')
+        message.headers = {}
+        payload = {
+            'task': self.mytask.name, 'id': uuid(),
+            'args': (1,), 'kwargs': {}, 'eta': '2026-11-01T01:30:00',
+            'utc': True, 'timelimit': (None, None),
+        }
+        message.payload = payload
+        req = Request(message, app=self.app, headers=payload,
+                      body=(1, {}, {}), decoded=True, utc=True)
+
+        assert req.eta.timestamp() == datetime.fromisoformat(
+            '2026-11-01T01:30:00+00:00').timestamp()
+        assert req.eta.isoformat() == '2026-10-31T21:30:00-04:00'
+
+    def test_expiration_uses_absolute_utc_instant(self):
+        tz = ZoneInfo('America/New_York')
+        req = self.xRequest(expires=datetime(2026, 3, 8, 3, 30, tzinfo=tz))
+        with patch('celery.worker.request.datetime') as fixed_datetime:
+            fixed_datetime.now.return_value = datetime.fromisoformat(
+                '2026-03-08T07:30:00+00:00')
+            assert not req.maybe_expire()
+            fixed_datetime.now.return_value = datetime.fromisoformat(
+                '2026-03-08T07:30:00.000001+00:00')
+            assert req.maybe_expire()
 
     def test_valid_expires_with_utc_makes_aware(self):
         with patch('celery.worker.request.maybe_make_aware') as mma:

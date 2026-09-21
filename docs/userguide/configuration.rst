@@ -299,8 +299,11 @@ Time and date settings
 
 Default: Enabled by default since version 3.0.
 
-If enabled dates and times in messages will be converted to use
-the UTC timezone.
+If enabled, the application clock defaults to UTC. Naive task ETA and
+expiration datetimes are interpreted using the configured :setting:`timezone`
+(or the system local timezone when this setting is disabled and no timezone is
+configured), while aware datetimes and serialized messages retain their
+absolute UTC offset.
 
 Note that workers running Celery versions below 2.5 will assume a local
 timezone for all messages, so only enable if all workers have been

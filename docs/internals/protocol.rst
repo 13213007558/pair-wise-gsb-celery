@@ -115,8 +115,8 @@ Changes from version 1
 
 - Always UTC
 
-    There's no ``utc`` flag anymore, so any time information missing timezone
-    will be expected to be in UTC time.
+    There's no ``utc`` flag. New messages include an explicit UTC offset.
+    Naive timestamps in old messages are interpreted as UTC.
 
 - Body is only for language specific data.
 
@@ -255,8 +255,8 @@ Message body
 
     .. versionadded:: 2.5
 
-    If true time uses the UTC timezone, if not the current local timezone
-    should be used.
+    Controls interpretation of naive timestamps that omit a UTC offset.
+    When false, the receiving worker uses its configured/local timezone.
 
 * ``callbacks``
     :`<list>Signature`:

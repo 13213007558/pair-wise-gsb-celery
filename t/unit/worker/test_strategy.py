@@ -1,5 +1,6 @@
 import logging
 from contextlib import contextmanager
+from datetime import datetime
 from unittest.mock import ANY, Mock, patch
 
 import pytest
@@ -291,6 +292,48 @@ class test_default_strategy_proto2:
             C()
             assert C.was_scheduled()
             C.consumer.qos.increment_eventually.assert_called_with()
+
+    @pytest.mark.parametrize('eta_value', [
+        '2026-03-08T02:30:00-05:00',
+        '2026-11-01T01:30:00-05:00',
+    ])
+    def test_eta_timer_deadline_is_absolute_epoch(self, monkeypatch, eta_value):
+        self.app.conf.enable_utc = False
+        self.app.conf.timezone = 'America/New_York'
+        del self.app.timezone
+        eta = datetime.fromisoformat(eta_value)
+        now_wall = eta.timestamp() - 3600
+        monkeypatch.setattr(
+            'celery.worker.strategy.to_timestamp',
+            lambda value, time=None, default_timezone=None: value.timestamp() - now_wall)
+
+        with self._context(self.add.s(2, 2).set(eta=eta)) as C:
+            C()
+
+        req = C.get_request()
+        scheduled_epoch = C.consumer.timer.call_at.call_args[0][0]
+        assert scheduled_epoch == pytest.approx(3600, abs=1e-9)
+        assert req.eta.timestamp() - now_wall == pytest.approx(
+            scheduled_epoch, abs=1e-9)
+
+    def test_task_received_event_eta_and_timer_use_same_instant(self, monkeypatch):
+        self.app.conf.enable_utc = False
+        self.app.conf.timezone = 'America/New_York'
+        del self.app.timezone
+        eta = datetime.fromisoformat('2026-11-01T01:30:00-05:00')
+        now_wall = eta.timestamp() - 3600
+        monkeypatch.setattr(
+            'celery.worker.strategy.to_timestamp',
+            lambda value, time=None, default_timezone=None: value.timestamp() - now_wall)
+
+        with self._context(self.add.s(2, 2).set(eta=eta)) as C:
+            C()
+
+        req = C.get_request()
+        event_eta = C.event_sent().kwargs['eta']
+        assert event_eta == req.eta.isoformat()
+        assert datetime.fromisoformat(event_eta).timestamp() == req.eta.timestamp()
+        assert C.consumer.timer.call_at.call_args[0][0] == pytest.approx(3600, abs=1e-9)
 
     def test_when_rate_limited(self):
         task = self.add.s(2, 2)

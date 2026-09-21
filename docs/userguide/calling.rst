@@ -280,8 +280,20 @@ is enforced once the ETA has passed: the task starts no earlier than its
 ETA, and rate limiting may delay it further beyond that point.
 
 While `countdown` is an integer, `eta` must be a :class:`~datetime.datetime`
-object, specifying an exact date and time (including millisecond precision,
-and timezone information):
+object. Naive datetimes are interpreted using the application's
+:setting:`timezone` setting. Aware datetimes retain their absolute instant.
+
+Repeated wall-clock times caused by a fall-back transition use the first
+occurrence. Missing wall-clock times caused by a spring-forward transition are
+moved forward to the first valid time. `countdown` always measures elapsed
+seconds, so a one-hour countdown across a transition remains one hour, rather
+than zero or two local clock hours.
+
+Messages serialize the UTC offset. Workers compare and schedule ETA/expiration
+values by absolute instant, while logs and events display them in the worker's
+configured timezone. Old protocol 1 messages without an offset use the
+message's ``utc`` flag; old protocol 2 messages without an offset are
+interpreted as UTC.
 
 .. code-block:: pycon
 
@@ -301,6 +313,21 @@ and timezone information):
     Moreover, tasks are not acknowledged until the worker starts executing
     them. If using Redis as a broker, task will get redelivered when `countdown`
     exceeds `visibility_timeout` (see :ref:`redis-caveats`).
+
+    The broker timeout is broker-owned and cannot distinguish a worker that is
+    intentionally waiting for an ETA from a lost worker. Configure
+    ``visibility_timeout`` to be at least the longest ETA/countdown delay, or
+    use broker-native delayed delivery. If a redelivery still happens, Celery
+    preserves the original absolute ETA/expiration: the replacement delivery
+    waits for the remaining time, and starts the task no earlier than the
+    original ETA. It does not attempt cross-worker duplicate suppression.
+
+    On a clean worker shutdown or restart, scheduled messages are released to
+    the broker and another worker interprets the same absolute ETA. A forced
+    restart waits for the broker redelivery timeout. Scheduling decisions use
+    the wall clock once, when the message is received, then convert to a
+    monotonic timer deadline; later clock drift or another DST transition does
+    not change that in-memory deadline.
 
     Therefore, using `eta` and `countdown` **is not recommended** for
     scheduling tasks for a distant future. Ideally, use values no longer

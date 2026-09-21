@@ -34,7 +34,8 @@ __all__ = (
     'LocalTimezone', 'timezone', 'maybe_timedelta',
     'delta_resolution', 'remaining', 'rate', 'weekday',
     'humanize_seconds', 'maybe_iso8601', 'is_naive',
-    'make_aware', 'localize', 'to_utc', 'maybe_make_aware',
+    'make_aware', 'normalize_aware', 'localize', 'to_utc',
+    'maybe_make_aware', 'deadline_from_now',
     'ffwd', 'utcoffset', 'adjust_timestamp',
     'get_exponential_backoff_interval',
 )
@@ -235,9 +236,13 @@ def remaining(
         ~datetime.timedelta: Remaining time.
     """
     now = now or datetime.now(datetime_timezone.utc)
-    end_date = start + ends_in
+    if isinstance(ends_in, ffwd):
+        end_date = start + ends_in
+    else:
+        end_date = start.astimezone(timezone.utc) + ends_in
     if relative:
-        end_date = delta_resolution(end_date, ends_in).replace(microsecond=0)
+        end_date = delta_resolution(
+            end_date.astimezone(start.tzinfo), ends_in).replace(microsecond=0)
 
     # Using UTC to calculate real time difference.
     # Python by default uses wall time in arithmetic between datetimes with
@@ -368,11 +373,26 @@ def make_aware(dt: datetime, tz: tzinfo) -> datetime:
     """Set timezone for a :class:`~datetime.datetime` object."""
 
     dt = dt.replace(tzinfo=tz)
-    if _is_ambiguous(dt, tz):
-        if _is_imaginary(dt, tz):
-            dt = dateutil_tz.resolve_imaginary(dt)
-        else:
-            dt = min(dt.replace(fold=0), dt.replace(fold=1))
+    if _is_imaginary(dt, tz):
+        # A missing wall-clock time in a spring-forward gap is assigned the
+        # corresponding valid time after the transition.
+        dt = dateutil_tz.resolve_imaginary(dt)
+    elif _is_ambiguous(dt, tz):
+        # Repeated wall-clock times are assigned to their first occurrence.
+        dt = dt.replace(fold=0)
+    return dt
+
+
+def normalize_aware(dt: datetime) -> datetime:
+    """Return an existing datetime representing the same absolute instant."""
+
+    if is_naive(dt):
+        return dt
+    tz = dt.tzinfo
+    if _is_imaginary(dt, tz):
+        if isinstance(tz, ZoneInfo) or hasattr(tz, 'is_ambiguous'):
+            return dt.astimezone(datetime_timezone.utc).astimezone(tz)
+        return dateutil_tz.resolve_imaginary(dt)
     return dt
 
 
@@ -383,9 +403,7 @@ def localize(dt: datetime, tz: tzinfo) -> datetime:
     """
     if is_naive(dt):  # Ensure timezone aware datetime
         dt = make_aware(dt, tz)
-    if dt.tzinfo == ZoneInfo("UTC"):
-        dt = dt.astimezone(tz)  # Always safe to call astimezone on utc zones
-    return dt
+    return normalize_aware(dt).astimezone(tz)
 
 
 def to_utc(dt: datetime) -> datetime:
@@ -395,14 +413,26 @@ def to_utc(dt: datetime) -> datetime:
 
 def maybe_make_aware(dt: datetime, tz: tzinfo | None = None,
                      naive_as_utc: bool = True) -> datetime:
-    """Convert dt to aware datetime, do nothing if dt is already aware."""
+    """Convert ``dt`` to an aware datetime.
+
+    Naive values use UTC when ``naive_as_utc`` is true, otherwise ``tz``.
+    Aware values retain their absolute instant and are normalized when their
+    local wall-clock representation falls in a spring-forward gap.
+    """
     if is_naive(dt):
         if naive_as_utc:
-            dt = to_utc(dt)
-        return localize(
-            dt, timezone.utc if tz is None else timezone.tz_or_local(tz),
-        )
-    return dt
+            tz = timezone.utc
+        tz = timezone.tz_or_local(tz)
+        return make_aware(dt, tz)
+    return normalize_aware(dt)
+
+
+def deadline_from_now(seconds: float, now: datetime, tz: tzinfo) -> datetime:
+    """Return ``seconds`` after ``now`` without doing local wall arithmetic."""
+
+    now = maybe_make_aware(now, tz, naive_as_utc=False)
+    deadline = now.astimezone(timezone.utc) + timedelta(seconds=seconds)
+    return deadline.astimezone(now.tzinfo)
 
 
 class ffwd:

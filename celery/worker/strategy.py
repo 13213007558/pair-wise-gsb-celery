@@ -1,5 +1,6 @@
 """Task execution strategy (optimization)."""
 import logging
+from datetime import timezone
 
 from kombu.asynchronous.timer import to_timestamp
 
@@ -9,8 +10,6 @@ from celery.exceptions import InvalidTaskError
 from celery.utils.imports import symbol_by_name
 from celery.utils.log import get_logger
 from celery.utils.saferepr import saferepr
-from celery.utils.time import timezone
-
 from .request import create_request_cls
 from .state import task_reserved, task_scheduled
 
@@ -98,7 +97,7 @@ def proto1_to_proto2(message, body):
 
 def default(task, app, consumer,
             info=logger.info, error=logger.error, task_reserved=task_reserved,
-            to_system_tz=timezone.to_system, bytes=bytes,
+            bytes=bytes,
             proto1_to_proto2=proto1_to_proto2):
     """Default task execution strategy.
 
@@ -129,11 +128,10 @@ def default(task, app, consumer,
 
     revoked_tasks = consumer.controller.state.revoked
 
-    def task_message_handler(message, body, ack, reject, callbacks,
-                             to_timestamp=to_timestamp):
+    def task_message_handler(message, body, ack, reject, callbacks):
         if body is None and 'args' not in message.payload:
             body, headers, decoded, utc = (
-                message.body, message.headers, False, app.uses_utc_timezone(),
+                message.body, message.headers, False, True,
             )
         else:
             if 'args' in message.payload:
@@ -179,10 +177,7 @@ def default(task, app, consumer,
         eta = None
         if req.eta:
             try:
-                if req.utc:
-                    eta = to_timestamp(to_system_tz(req.eta))
-                else:
-                    eta = to_timestamp(req.eta, app.timezone)
+                eta = to_timestamp(req.eta.astimezone(timezone.utc))
             except (OverflowError, ValueError) as exc:
                 error("Couldn't convert ETA %r to timestamp: %r. Task: %r",
                       req.eta, exc, req.info(safe=True), exc_info=True)
