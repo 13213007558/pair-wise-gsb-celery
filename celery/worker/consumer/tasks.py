@@ -29,6 +29,7 @@ class Tasks(bootsteps.StartStopStep):
     def start(self, c):
         """Start task consumer."""
         c.update_strategies()
+        c._reset_task_deliveries()
 
         qos_global = self.qos_global(c)
         # Record effective QoS mode on the consumer so the reconnect path

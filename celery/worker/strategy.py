@@ -148,6 +148,21 @@ def default(task, app, consumer,
             eventer=eventer, task=task, connection_errors=connection_errors,
             body=body, headers=headers, decoded=decoded, utc=utc,
         )
+        consumer.track_task_delivery(req)
+        ack_promise = getattr(ack, 'celery_delivery_operation', None)
+        reject_promise = getattr(reject, 'celery_delivery_operation', None)
+        if ack_promise is not None:
+            ack_promise.then(
+                lambda *args, req=req: req.delivery_operation_completed(),
+                on_error=lambda *args, req=req: req.delivery_operation_failed(),
+            )
+        if reject_promise is not None:
+            reject_promise.then(
+                lambda *args, req=req: req.delivery_operation_completed(
+                    rejected=True),
+                on_error=lambda *args, req=req: req.delivery_operation_failed(
+                    rejected=True),
+            )
         if _does_info:
             # Similar to `app.trace.info()`, we pass the formatting args as the
             # `extra` kwarg for custom log handlers

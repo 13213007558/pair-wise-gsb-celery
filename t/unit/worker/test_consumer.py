@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, Mock, call, patch
 import pytest
 from amqp import ChannelError
 from billiard.exceptions import RestartFreqExceeded
-from kombu import Queue
+from kombu import Message, Queue
 
 from celery import bootsteps
 from celery.contrib.testing.mocks import ContextMock
@@ -26,6 +26,27 @@ from celery.worker.consumer.heart import Heart
 from celery.worker.consumer.mingle import Mingle
 from celery.worker.consumer.tasks import Tasks
 from celery.worker.state import active_requests, successful_requests
+from celery.worker.request import (
+    DELIVERY_ACK_UNCERTAIN,
+    DELIVERY_ACKED,
+    DELIVERY_REDIRECTED,
+    DELIVERY_REJECTED,
+)
+
+
+class FakeChannel:
+
+    no_ack_consumers = None
+
+    def __init__(self):
+        self.events = []
+
+    def basic_ack(self, delivery_tag, multiple=False):
+        self.events.append(('ack', delivery_tag, multiple))
+
+    def basic_reject(self, delivery_tag, requeue=False):
+        self.events.append(
+            ('requeue' if requeue else 'reject', delivery_tag))
 
 
 class FakeOnCloseRequest:
@@ -300,6 +321,8 @@ class test_Consumer(ConsumerTestCase):
         c = self.get_consumer()
         c.qos = MagicMock()
         c.qos.value = 1
+        c.qos._mutex.__enter__.return_value = None
+        c.qos._mutex.__exit__.return_value = False
         c._maximum_prefetch_restored = False
 
         sig = self.add.s(2, 2)
@@ -324,6 +347,95 @@ class test_Consumer(ConsumerTestCase):
 
         with subtests.test("maximum prefetch is reached"):
             assert c._maximum_prefetch_restored is True
+
+    def test_delivery_states_are_recoverable_from_channel_events(self):
+        c = self.get_consumer()
+        c.qos = Mock()
+        c.hub = None
+        captured = {}
+
+        def make_message(tag):
+            raw = self.TaskMessage(
+                self.add.name,
+                f'task-{tag}',
+                root_id=f'root-{tag}',
+                parent_id=f'parent-{tag}',
+                delivery_tag=tag,
+            )
+            channel = FakeChannel()
+            if tag == 24:
+                channel.basic_ack = Mock(
+                    side_effect=ConnectionError('broker gone'))
+            message = Message(
+                channel=channel,
+                body=raw.payload,
+                delivery_tag=tag,
+                delivery_info={
+                    'delivery_tag': tag,
+                    'redelivered': tag % 2 == 1,
+                },
+                headers=raw.headers,
+            )
+            message.raw = raw
+            return channel, message
+
+        def strategy(message, body, ack, reject, callbacks):
+            raw = message.raw
+            from celery.worker.request import Request
+            request = Request(
+                message,
+                app=self.app,
+                task=self.add,
+                body=body,
+                headers=raw.headers,
+                decoded=True,
+                on_ack=ack,
+                on_reject=reject,
+                connection_errors=c.connection_errors,
+            )
+            c.track_task_delivery(request)
+            ack.celery_delivery_operation.then(
+                lambda *args: request.delivery_operation_completed(),
+                on_error=lambda *args: request.delivery_operation_failed(),
+            )
+            reject.celery_delivery_operation.then(
+                lambda *args: request.delivery_operation_completed(
+                    rejected=True),
+                on_error=lambda *args: request.delivery_operation_failed(
+                    rejected=True),
+            )
+            captured[message.delivery_tag] = (
+                message.channel, request, ack, reject,
+            )
+
+        c.strategies[self.add.name] = strategy
+        handler = c.create_task_handler()
+        for tag in (21, 22, 23, 24):
+            _, message = make_message(tag)
+            handler(message)
+
+        captured[22][1].acknowledge()
+        captured[23][1].reject(requeue=True)
+        captured[24][1].acknowledge()
+
+        c.on_connection_error_after_connected(ConnectionError('restart'))
+
+        assert captured[21][1].delivery_state == DELIVERY_REDIRECTED
+        assert captured[22][1].delivery_state == DELIVERY_ACKED
+        assert captured[23][1].delivery_state == DELIVERY_REJECTED
+        assert captured[24][1].delivery_state == DELIVERY_ACK_UNCERTAIN
+        assert captured[21][0].events == []
+        assert captured[22][0].events == [('ack', 22, False)]
+        assert captured[23][0].events == [('requeue', 23)]
+        assert captured[24][1].delivery_info == {
+            'delivery_tag': 24,
+            'redelivered': False,
+            'exchange': None,
+            'routing_key': None,
+            'priority': None,
+        }
+        assert captured[24][1].root_id == 'root-24'
+        assert captured[24][1].parent_id == 'parent-24'
 
     def test_flush_events(self):
         c = self.get_consumer()
@@ -704,7 +816,8 @@ class test_Consumer(ConsumerTestCase):
 
         c.on_connection_error_after_connected(Mock())
 
-        mock_request_acks_late_not_acknowledged.cancel.assert_called_once_with(c.pool)
+        mock_request_acks_late_not_acknowledged.cancel.assert_called_once_with(
+            c.pool, emit_retry=False, connection_lost=True)
         mock_request_acks_late_acknowledged.cancel.assert_not_called()
         mock_request_acks_early.cancel.assert_not_called()
 
@@ -734,9 +847,10 @@ class test_Consumer(ConsumerTestCase):
 
         try:
             c.on_connection_error_after_connected(Mock())
-
-            mock_request_cancel_raises.cancel.assert_called_once_with(c.pool)
-            mock_request_cancel_succeeds.cancel.assert_called_once_with(c.pool)
+            mock_request_cancel_raises.cancel.assert_called_once_with(
+                c.pool, emit_retry=False, connection_lost=True)
+            mock_request_cancel_succeeds.cancel.assert_called_once_with(
+                c.pool, emit_retry=False, connection_lost=True)
         finally:
             active_requests.clear()
 

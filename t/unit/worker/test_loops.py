@@ -191,26 +191,40 @@ class test_asynloop:
         return x, on_task, message, strategy
 
     def test_on_task_received(self):
-        x, on_task, msg, strategy = self.task_context(self.add.s(2, 2))
+        x = X(self.app)
+        schedule = x._consumer.call_soon_ack = Mock()
+        x.blueprint.state = CLOSE
+        asynloop(*x.args)
+        msg = self.task_message_from_sig(self.app, self.add.s(2, 2))
+        strategy = x.obj.strategies[self.add.name] = Mock()
+        on_task = x.consumer.on_message
         on_task(msg)
-        strategy.assert_called_with(
-            msg, None,
-            PromiseEqual(x._consumer.call_soon_ack, msg.ack_log_error),
-            PromiseEqual(x._consumer.call_soon_ack, msg.reject_log_error), [],
-        )
+        assert strategy.call_args.args[:2] == (msg, None)
+        assert strategy.call_args.args[4] == []
+        ack, reject = strategy.call_args.args[2:4]
+        ack()
+        reject()
+        assert schedule.call_count == 2
+        assert schedule.call_args_list[0].args[0].fun.fun == msg.ack_log_error
+        assert schedule.call_args_list[1].args[0].fun.fun == msg.reject_log_error
 
     def test_on_task_received_executes_on_task_message(self):
         cbs = [Mock(), Mock(), Mock()]
-        x, on_task, msg, strategy = self.task_context(
-            self.add.s(2, 2), on_task_message=cbs,
-        )
+        x = X(self.app, on_task_message=cbs)
+        schedule = x._consumer.call_soon_ack = Mock()
+        x.blueprint.state = CLOSE
+        asynloop(*x.args)
+        msg = self.task_message_from_sig(self.app, self.add.s(2, 2))
+        strategy = x.obj.strategies[self.add.name] = Mock()
+        on_task = x.consumer.on_message
         on_task(msg)
-        strategy.assert_called_with(
-            msg, None,
-            PromiseEqual(x._consumer.call_soon_ack, msg.ack_log_error),
-            PromiseEqual(x._consumer.call_soon_ack, msg.reject_log_error),
-            cbs,
-        )
+        assert strategy.call_args.args[:2] == (msg, None)
+        assert strategy.call_args.args[4] == cbs
+        ack, reject = strategy.call_args.args[2:4]
+        ack()
+        reject()
+        assert schedule.call_args_list[0].args[0].fun.fun == msg.ack_log_error
+        assert schedule.call_args_list[1].args[0].fun.fun == msg.reject_log_error
 
     def test_on_task_message_missing_name(self):
         x, on_task, msg, strategy = self.task_context(self.add.s(2, 2))

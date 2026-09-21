@@ -5,7 +5,9 @@ how tasks are executed.
 """
 import logging
 import sys
+from collections.abc import Mapping
 from datetime import datetime
+from threading import RLock
 from time import monotonic, time
 from weakref import ref
 
@@ -39,6 +41,46 @@ IS_PYPY = hasattr(sys, 'pypy_version_info')
 logger = get_logger(__name__)
 debug, info, warn, error = (logger.debug, logger.info,
                             logger.warning, logger.error)
+
+REQUEST_PENDING = 'PENDING'
+REQUEST_STARTED = 'STARTED'
+REQUEST_SUCCEEDED = 'SUCCEEDED'
+REQUEST_FAILED = 'FAILED'
+REQUEST_RETRY = 'RETRY'
+REQUEST_WORKER_LOST = 'WORKER_LOST'
+REQUEST_CANCELLED = 'CANCELLED'
+REQUEST_REVOKED = 'REVOKED'
+
+DELIVERY_PENDING = 'PENDING'
+DELIVERY_ACK_PENDING = 'ACK_PENDING'
+DELIVERY_REJECT_PENDING = 'REJECT_PENDING'
+DELIVERY_ACKED = 'ACKED'
+DELIVERY_REJECTED = 'REJECTED'
+DELIVERY_ACK_UNCERTAIN = 'ACK_UNCERTAIN'
+DELIVERY_REJECT_UNCERTAIN = 'REJECT_UNCERTAIN'
+DELIVERY_REDIRECTED = 'REDIRECTED'
+
+RESOLVED_DELIVERY_STATES = frozenset({
+    DELIVERY_ACKED,
+    DELIVERY_REJECTED,
+    DELIVERY_ACK_UNCERTAIN,
+    DELIVERY_REJECT_UNCERTAIN,
+    DELIVERY_REDIRECTED,
+})
+
+ACKED_DELIVERY_STATES = frozenset({
+    DELIVERY_ACKED,
+    DELIVERY_ACK_UNCERTAIN,
+})
+
+SETTLED_DELIVERY_STATES = (
+    RESOLVED_DELIVERY_STATES - {DELIVERY_REDIRECTED}
+)
+
+REJECTED_DELIVERY_STATES = frozenset({
+    DELIVERY_REJECTED,
+    DELIVERY_REJECT_UNCERTAIN,
+})
 _does_info = False
 _does_debug = False
 
@@ -67,7 +109,6 @@ revoked_stamps = state.revoked_stamps
 class Request:
     """A request for task execution."""
 
-    acknowledged = False
     time_start = None
     worker_pid = None
     time_limits = (None, None)
@@ -76,6 +117,9 @@ class Request:
     _terminate_on_ack = None
     _apply_result = None
     _tzlocal = None
+
+    request_state = REQUEST_PENDING
+    delivery_state = DELIVERY_PENDING
 
     #: Timer entry for this request's pending ETA/countdown callback, set by
     #: :mod:`celery.worker.strategy` when the request is scheduled so that
@@ -90,6 +134,7 @@ class Request:
             '_task', '_eta', '_expires', '_request_dict', '_on_reject', '_utc',
             '_content_type', '_content_encoding', '_argsrepr', '_kwargsrepr',
             '_args', '_kwargs', '_decoded', '__payload',
+            '_delivery_tag', '_delivery_lock', '_delivery_state',
             '__weakref__', '__dict__',
         )
 
@@ -160,14 +205,30 @@ class Request:
         else:
             self._expires = None
 
-        delivery_info = message.delivery_info or {}
+        delivery_info = message.delivery_info
+        if not isinstance(delivery_info, Mapping):
+            delivery_info = {}
         properties = message.properties or {}
+        headers = self._request_dict
+        delivery_tag = delivery_info.get(
+            'delivery_tag',
+            headers.get('delivery_tag', getattr(message, 'delivery_tag', None)),
+        )
+        redelivered = delivery_info.get(
+            'redelivered',
+            headers.get('redelivered', False),
+        )
         self._delivery_info = {
             'exchange': delivery_info.get('exchange'),
             'routing_key': delivery_info.get('routing_key'),
             'priority': properties.get('priority'),
-            'redelivered': delivery_info.get('redelivered', False),
+            'delivery_tag': delivery_tag,
+            'redelivered': redelivered,
         }
+        self._delivery_tag = delivery_tag
+        self._delivery_lock = RLock()
+        self._delivery_state = DELIVERY_PENDING
+        self._cancel_connection_lost = False
         self._request_dict.update({
             'properties': properties,
             'reply_to': properties.get('reply_to'),
@@ -183,6 +244,22 @@ class Request:
     @property
     def delivery_info(self):
         return self._delivery_info
+
+    @property
+    def delivery_tag(self):
+        return self._delivery_tag
+
+    @property
+    def delivery_resolved(self):
+        return self.delivery_state in RESOLVED_DELIVERY_STATES
+
+    @property
+    def delivery_state(self):
+        return self._delivery_state
+
+    @delivery_state.setter
+    def delivery_state(self, value):
+        self._delivery_state = value
 
     @property
     def message(self):
@@ -223,6 +300,14 @@ class Request:
     @property
     def parent_id(self):
         return self._parent_id
+
+    @property
+    def acknowledged(self):
+        return self.delivery_state in SETTLED_DELIVERY_STATES
+
+    @acknowledged.setter
+    def acknowledged(self, value):
+        self._delivery_state = DELIVERY_ACKED if value else DELIVERY_PENDING
 
     @property
     def argsrepr(self):
@@ -358,6 +443,7 @@ class Request:
         task = self._task
         if self.revoked():
             raise TaskRevokedError(task_id)
+        self.request_state = REQUEST_STARTED
 
         time_limit, soft_time_limit = self.time_limits
         trace = fast_trace_task if self._app.use_fast_trace_task else trace_task_ret
@@ -386,6 +472,7 @@ class Request:
         """
         if self.revoked():
             return
+        self.request_state = REQUEST_STARTED
 
         # acknowledge task as being processed.
         if not self.task.acks_late:
@@ -431,8 +518,10 @@ class Request:
             if obj is not None:
                 obj.terminate(signal)
 
-    def cancel(self, pool, signal=None, emit_retry=True):
+    def cancel(self, pool, signal=None, emit_retry=True,
+               connection_lost=False):
         signal = _signals.signum(signal or TERM_SIGNAME)
+        self._cancel_connection_lost = connection_lost
         if self.time_start:
             pool.terminate_job(self.worker_pid, signal)
             self._announce_cancelled(emit_retry=emit_retry)
@@ -443,6 +532,7 @@ class Request:
                 obj.terminate(signal)
 
     def _announce_cancelled(self, emit_retry=True):
+        self.request_state = REQUEST_CANCELLED
         task_ready(self)
         self.send_event('task-cancelled')
 
@@ -461,14 +551,15 @@ class Request:
             send_retry(self.task, request=self._context, einfo=None)
 
     def _announce_revoked(self, reason, terminated, signum, expired):
+        self.request_state = REQUEST_REVOKED
         task_ready(self)
         self.send_event('task-revoked',
                         terminated=terminated, signum=signum, expired=expired)
+        self.acknowledge()
         self.task.backend.mark_as_revoked(
             self.id, reason, request=self._context,
             store_result=self.store_errors,
         )
-        self.acknowledge()
         self._already_revoked = True
         send_revoked(self.task, request=self._context,
                      terminated=terminated, signum=signum, expired=expired)
@@ -521,6 +612,7 @@ class Request:
     def on_accepted(self, pid, time_accepted):
         """Handler called when task is accepted by worker pool."""
         self.worker_pid = pid
+        self.request_state = REQUEST_STARTED
         # Convert monotonic time_accepted to absolute time
         self.time_start = time() - (monotonic() - time_accepted)
         task_accepted(self)
@@ -538,9 +630,15 @@ class Request:
             warn('Soft time limit (%ss) exceeded for %s[%s]',
                  timeout, self.name, self.id)
         else:
+            self.request_state = REQUEST_FAILED
             task_ready(self)
-            # This is a special case where the task timeout handling is done during
-            # the cold shutdown process.
+
+            if self.task.acks_late:
+                if self.task.acks_on_timeout:
+                    self.acknowledge()
+                else:
+                    self.reject(requeue=True)
+
             if not state.should_terminate:
                 error('Hard time limit (%ss) exceeded for %s[%s]', timeout, self.name, self.id)
                 exc = TimeLimitExceeded(timeout)
@@ -603,12 +701,6 @@ class Request:
                         del einfo
                     exc.__traceback__ = None
 
-            if self.task.acks_late:
-                if self.task.acks_on_timeout:
-                    self.acknowledge()
-                else:
-                    self.reject(requeue=True)
-
     def on_success(self, failed__retval__runtime, **kwargs):
         """Handler called if the task was successfully processed."""
         failed, retval, runtime = failed__retval__runtime
@@ -619,6 +711,7 @@ class Request:
             if isinstance(exc, (SystemExit, KeyboardInterrupt)):
                 raise exc
             return self.on_failure(retval, return_ok=True)
+        self.request_state = REQUEST_SUCCEEDED
         task_ready(self, successful=True)
 
         if self.task.acks_late:
@@ -628,6 +721,7 @@ class Request:
 
     def on_retry(self, exc_info):
         """Handler called if the task should be retried."""
+        self.request_state = REQUEST_RETRY
         if self.task.acks_late:
             self.acknowledge()
 
@@ -637,6 +731,7 @@ class Request:
 
     def on_failure(self, exc_info, send_failed_event=True, return_ok=False):
         """Handler called if the task raised an exception."""
+        self.request_state = REQUEST_FAILED
         task_ready(self)
         exc = exc_info.exception
 
@@ -645,41 +740,28 @@ class Request:
 
         is_terminated = isinstance(exc, Terminated)
         if is_terminated:
-            # If the task was terminated and the task was not cancelled due
-            # to a connection loss, it is revoked.
-
-            # We always cancel the tasks inside the master process.
-            # If the request was cancelled, it was not revoked and there's
-            # nothing to be done.
-            # According to the comment below, we need to check if the task
-            # is already revoked and if it wasn't, we should announce that
-            # it was.
             if not self._already_cancelled and not self._already_revoked:
-                # This is a special case where the process
-                # would not have had time to write the result.
                 self._announce_revoked(
                     'terminated', True, str(exc), False)
+            elif self._already_cancelled and not self._cancel_connection_lost:
+                self._settle_worker_lost()
             return
         if isinstance(exc, (SystemExit, KeyboardInterrupt)):
-            if self._already_cancelled or self._already_revoked:
-                # The child was killed by the signal we sent, so this is not
-                # a task failure; leave the message unacked so it gets
-                # redelivered.
+            if not (self._already_cancelled or self._already_revoked):
+                exc_info = self._worker_lost_info(exc)
+                exc = exc_info.exception
+                if isinstance(exc, ExceptionWithTraceback):
+                    exc = exc.exc
+            elif self._already_cancelled and not self._cancel_connection_lost:
+                self._settle_worker_lost()
                 return
-            # Billiard >= 4.3.0 reports the exit before the child terminates;
-            # the process is still gone, so keep treating it as a lost worker.
-            exc_info = self._worker_lost_info(exc)
-            exc = exc_info.exception
-            if isinstance(exc, ExceptionWithTraceback):
-                exc = exc.exc
+            else:
+                return
         elif isinstance(exc, MemoryError):
             raise MemoryError(f'Process got: {exc}')
         elif isinstance(exc, Reject):
+            self.reject(requeue=exc.requeue)
             if not exc.requeue:
-                # A task that rejects its message without requeueing will
-                # never run again, so record a terminal FAILURE result and
-                # fire the task_failure signal instead of leaving the task
-                # stuck in PENDING/STARTED forever (Issue #4222).
                 self.task.backend.mark_as_failure(
                     self.id, exc, request=self._context,
                     store_result=self.store_errors,
@@ -696,15 +778,16 @@ class Request:
                             get_pickled_exception(exc_info.exception)),
                         traceback=exc_info.traceback,
                     )
-            return self.reject(requeue=exc.requeue)
+            return
         elif isinstance(exc, Ignore):
             return self.acknowledge()
         elif isinstance(exc, Retry):
             return self.on_retry(exc_info)
 
-        # (acks_late) acknowledge after result stored.
         requeue = False
         is_worker_lost = isinstance(exc, WorkerLostError)
+        if is_worker_lost:
+            self.request_state = REQUEST_WORKER_LOST
         if self.task.acks_late:
             is_timeout = isinstance(exc, TimeLimitExceeded)
             ack_flag = self.task.acks_on_timeout if is_timeout else self.task.acks_on_failure
@@ -719,20 +802,13 @@ class Request:
             elif ack_flag:
                 self.acknowledge()
             else:
-                # supporting the behaviour where a task failed and
-                # need to be removed from prefetched local queue
                 self.reject(requeue=False)
 
-        # This is a special case where the task failure handling is done during
-        # the cold shutdown process.
         if state.should_terminate:
             return_ok = True
             send_failed_event = False
 
-        # This is a special case where the process would not have had time
-        # to write the result.
         if not requeue and (is_worker_lost or not return_ok):
-            # only mark as failure if task has not been requeued
             self.task.backend.mark_as_failure(
                 self.id, exc, request=self._context,
                 store_result=self.store_errors,
@@ -770,29 +846,153 @@ class Request:
         except WorkerLostError:
             return ExceptionInfo()
 
+    def _settle_worker_lost(self):
+        self.request_state = REQUEST_WORKER_LOST
+        if self.task.reject_on_worker_lost:
+            self.reject(requeue=True)
+        else:
+            with self._delivery_lock:
+                if not self.delivery_resolved:
+                    self.delivery_state = DELIVERY_REDIRECTED
+
+    def _message_delivery_state(self):
+        return getattr(self._message, '_state', None)
+
+    def _message_operation_completed(self, rejected=False):
+        operation = getattr(
+            self._on_reject if rejected else self._on_ack,
+            'celery_delivery_operation', None,
+        )
+        if operation is not None:
+            if getattr(operation, 'failed', False):
+                return False
+            if getattr(operation, 'ready', False):
+                state = self._message_delivery_state()
+                if state is not None and not getattr(
+                        self._on_reject if rejected else self._on_ack,
+                        'deferred', False):
+                    return (
+                        state in {'REJECTED', 'REQUEUED'}
+                        if rejected else state == 'ACK'
+                    )
+                return True
+            return None
+
+        state = self._message_delivery_state()
+        if state is None:
+            return True
+        if rejected:
+            return state in {'REJECTED', 'REQUEUED'}
+        return state == 'ACK'
+
+    def _settle_delivery(self, pending_state, completed_state, uncertain_state,
+                         operation, rejected=False):
+        with self._delivery_lock:
+            if self.delivery_resolved:
+                return False
+
+            self.delivery_state = pending_state
+            try:
+                operation()
+            except Exception:
+                self.delivery_state = uncertain_state
+                raise
+
+            if self.delivery_state == uncertain_state:
+                return False
+            completed = self._message_operation_completed(rejected=rejected)
+            if completed is False:
+                self.delivery_state = uncertain_state
+                return True
+            if completed is True:
+                self.delivery_state = completed_state
+            return True
+
+    def delivery_operation_completed(self, rejected=False):
+        with self._delivery_lock:
+            if self.delivery_resolved:
+                return self.delivery_state
+            completed = self._message_operation_completed(rejected=rejected)
+            if completed is True:
+                self.delivery_state = (
+                    DELIVERY_REJECTED if rejected else DELIVERY_ACKED
+                )
+            return self.delivery_state
+
+    def delivery_operation_failed(self, rejected=False):
+        with self._delivery_lock:
+            if self.delivery_resolved:
+                return self.delivery_state
+            self.delivery_state = (
+                DELIVERY_REJECT_UNCERTAIN if rejected
+                else DELIVERY_ACK_UNCERTAIN
+            )
+            return self.delivery_state
+
+    def mark_connection_lost(self):
+        """Record the broker outcome for a delivery whose channel is gone."""
+        with self._delivery_lock:
+            if self.delivery_resolved:
+                return self.delivery_state
+
+            message_state = self._message_delivery_state()
+            if self.delivery_state in {DELIVERY_ACKED, DELIVERY_REJECTED}:
+                return self.delivery_state
+            if self.delivery_state == DELIVERY_ACK_PENDING:
+                self.delivery_state = DELIVERY_ACK_UNCERTAIN
+            elif self.delivery_state == DELIVERY_REJECT_PENDING:
+                self.delivery_state = DELIVERY_REJECT_UNCERTAIN
+            elif message_state == 'ACK':
+                self.delivery_state = DELIVERY_ACK_UNCERTAIN
+            elif message_state in {'REJECTED', 'REQUEUED'}:
+                self.delivery_state = DELIVERY_REJECT_UNCERTAIN
+            else:
+                self.delivery_state = DELIVERY_REDIRECTED
+            return self.delivery_state
+
     def acknowledge(self):
         """Acknowledge task."""
-        if not self.acknowledged:
-            self._on_ack(logger, self._connection_errors)
-            self.acknowledged = True
+        self._settle_delivery(
+            DELIVERY_ACK_PENDING,
+            DELIVERY_ACKED,
+            DELIVERY_ACK_UNCERTAIN,
+            lambda: self._on_ack(logger, self._connection_errors),
+        )
+        return self.delivery_state == DELIVERY_ACKED
 
     def reject(self, requeue=False):
-        if not self.acknowledged:
-            self._on_reject(logger, self._connection_errors, requeue)
-            self.acknowledged = True
-            self.send_event('task-rejected', requeue=requeue)
+        try:
+            self._settle_delivery(
+                DELIVERY_REJECT_PENDING,
+                DELIVERY_REJECTED,
+                DELIVERY_REJECT_UNCERTAIN,
+                lambda: self._on_reject(logger, self._connection_errors, requeue),
+                rejected=True,
+            )
+        finally:
+            if self.delivery_state in {
+                    DELIVERY_REJECTED,
+                    DELIVERY_REJECT_PENDING,
+            }:
+                self.send_event('task-rejected', requeue=requeue)
 
     def info(self, safe=False):
         return {
             'id': self.id,
             'name': self.name,
+            'root_id': self.root_id,
+            'parent_id': self.parent_id,
             'args': self._args if not safe else self._argsrepr,
             'kwargs': self._kwargs if not safe else self._kwargsrepr,
             'type': self._type,
             'hostname': self._hostname,
             'time_start': self.time_start,
+            'request_state': self.request_state,
+            'delivery_state': self.delivery_state,
             'acknowledged': self.acknowledged,
             'delivery_info': self.delivery_info,
+            'delivery_tag': self.delivery_tag,
+            'redelivered': self.delivery_info.get('redelivered', False),
             'worker_pid': self.worker_pid,
         }
 

@@ -8,6 +8,7 @@ from unittest.mock import ANY, Mock, patch
 
 import pytest
 from billiard.einfo import ExceptionInfo
+from kombu import Message
 from kombu.utils.encoding import from_utf8, safe_repr, safe_str
 from kombu.utils.uuid import uuid
 
@@ -20,9 +21,31 @@ from celery.exceptions import (Ignore, InvalidTaskError, Reject, Retry, TaskRevo
 from celery.signals import task_failure, task_retry, task_revoked
 from celery.worker import request as module
 from celery.worker import strategy
-from celery.worker.request import Request, create_request_cls
+from celery.worker.request import (
+    DELIVERY_ACK_UNCERTAIN,
+    DELIVERY_ACKED,
+    DELIVERY_REDIRECTED,
+    REQUEST_STARTED,
+    Request,
+    create_request_cls,
+)
 from celery.worker.request import logger as req_logger
 from celery.worker.state import revoked, revoked_stamps
+
+
+class FakeChannel:
+
+    no_ack_consumers = None
+
+    def __init__(self):
+        self.events = []
+
+    def basic_ack(self, delivery_tag, multiple=False):
+        self.events.append(('ack', delivery_tag, multiple))
+
+    def basic_reject(self, delivery_tag, requeue=False):
+        operation = 'requeue' if requeue else 'reject'
+        self.events.append((operation, delivery_tag))
 
 
 class RequestCase:
@@ -211,6 +234,128 @@ class test_Request(RequestCase):
     def test_shadow(self):
         assert self.get_request(
             self.add.s(2, 2).set(shadow='fooxyz')).name == 'fooxyz'
+
+    def delivered_request(self, *, redelivered=False, delivery_tag=7,
+                          root_id='root', parent_id='parent'):
+        raw = self.TaskMessage(
+            self.add.name,
+            'task-id',
+            root_id=root_id,
+            parent_id=parent_id,
+            redelivered=redelivered,
+            delivery_tag=delivery_tag,
+        )
+        channel = FakeChannel()
+        message = Message(
+            channel=channel,
+            body=raw.body,
+            delivery_tag=delivery_tag,
+            content_type=raw.content_type,
+            content_encoding=raw.content_encoding,
+            delivery_info={
+                'delivery_tag': delivery_tag,
+                'redelivered': redelivered,
+            },
+            headers=raw.headers,
+        )
+        request = Request(
+            message,
+            app=self.app,
+            task=self.add,
+            body=raw.payload,
+            headers=raw.headers,
+            decoded=True,
+            on_ack=message.ack_log_error,
+            on_reject=message.reject_log_error,
+        )
+        return channel, message, request
+
+    def test_delivery_metadata_is_preserved(self):
+        channel, _, request = self.delivered_request(
+            redelivered=True, delivery_tag=42)
+        assert request.delivery_tag == 42
+        assert request.root_id == 'root'
+        assert request.parent_id == 'parent'
+        assert request.delivery_info['redelivered'] is True
+        assert request.info()['delivery_tag'] == 42
+        assert request.info()['redelivered'] is True
+        assert channel.events == []
+
+    def test_delivery_has_one_broker_conclusion(self):
+        channel, _, request = self.delivered_request(delivery_tag=9)
+        request.acknowledge()
+        request.acknowledge()
+        request.reject()
+        assert request.delivery_state == DELIVERY_ACKED
+        assert channel.events == [('ack', 9, False)]
+
+    def test_failed_ack_does_not_permit_reject_on_same_delivery(self):
+        channel, _, request = self.delivered_request(delivery_tag=10)
+        request._on_ack = Mock(side_effect=ConnectionError('broker gone'))
+        request._on_reject = Mock()
+        with pytest.raises(ConnectionError):
+            request.acknowledge()
+        request.reject()
+        assert request.delivery_state == DELIVERY_ACK_UNCERTAIN
+        request._on_reject.assert_not_called()
+        assert channel.events == []
+
+    def test_connection_loss_marks_undecided_delivery_redirected(self):
+        _, _, request = self.delivered_request(delivery_tag=11)
+        assert request.mark_connection_lost() == DELIVERY_REDIRECTED
+        request.acknowledge()
+        request.reject()
+        assert request.delivery_state == DELIVERY_REDIRECTED
+
+    def test_on_accepted_marks_request_started(self):
+        _, _, request = self.delivered_request()
+        request.on_accepted(123, 0)
+        assert request.request_state == REQUEST_STARTED
+        assert request.worker_pid == 123
+
+    def test_worker_lost_sigterm_rejects_once_with_redelivery_context(self):
+        channel, _, request = self.delivered_request(delivery_tag=13)
+        request.time_start = 1
+        request.task.acks_late = True
+        request.task.reject_on_worker_lost = True
+        request._already_cancelled = True
+        try:
+            raise SystemExit(-15)
+        except SystemExit:
+            exc_info = ExceptionInfo()
+        request.on_failure(exc_info)
+        request.on_failure(exc_info)
+        assert channel.events == [('requeue', 13)]
+        assert request.delivery_info['redelivered'] is False
+
+    def test_connection_loss_sigterm_does_not_reject_old_delivery(self):
+        channel, _, request = self.delivered_request(delivery_tag=14)
+        request.time_start = 1
+        request.task.acks_late = True
+        request.task.reject_on_worker_lost = True
+        request.mark_connection_lost()
+        request._already_cancelled = True
+        request._cancel_connection_lost = True
+        try:
+            raise SystemExit(-15)
+        except SystemExit:
+            exc_info = ExceptionInfo()
+        request.on_failure(exc_info)
+        assert channel.events == []
+        assert request.delivery_state == DELIVERY_REDIRECTED
+
+    def test_failure_backend_error_does_not_change_ack_decision(self):
+        channel, _, request = self.delivered_request(delivery_tag=15)
+        request.task.acks_late = True
+        request.task.backend.mark_as_failure = Mock(side_effect=RuntimeError)
+        try:
+            raise KeyError('failed')
+        except KeyError:
+            exc_info = ExceptionInfo()
+        with pytest.raises(RuntimeError):
+            request.on_failure(exc_info, send_failed_event=False)
+        assert channel.events == [('ack', 15, False)]
+        assert request.delivery_state == DELIVERY_ACKED
 
     def test_args(self):
         args = (2, 2)

@@ -45,6 +45,14 @@ logger = get_logger(__name__)
 debug, info, warn, error, crit = (logger.debug, logger.info, logger.warning,
                                   logger.error, logger.critical)
 
+
+def _delivery_resolved(request):
+    resolved = getattr(request, 'delivery_resolved', None)
+    if isinstance(resolved, bool):
+        return resolved
+    return bool(getattr(request, 'acknowledged', False))
+
+
 CONNECTION_RETRY = """\
 consumer: Connection to broker lost. \
 Trying to re-establish the connection...\
@@ -247,6 +255,7 @@ class Consumer:
             self.app.conf.broker_connection_timeout = None
 
         self._pending_operations = []
+        self._task_deliveries = {}
 
         self.steps = []
         self.blueprint = self.Blueprint(
@@ -293,6 +302,25 @@ class Consumer:
                     self._pending_operations.pop()()
                 except Exception as exc:  # pylint: disable=broad-except
                     logger.exception('Pending callback raised: %r', exc)
+
+    def _reset_task_deliveries(self):
+        self._task_deliveries = {}
+
+    def track_task_delivery(self, request):
+        deliveries = getattr(self, '_task_deliveries', None)
+        if deliveries is not None:
+            deliveries[request.message] = request
+
+    def mark_task_deliveries_connection_lost(self):
+        for request in tuple(self._task_deliveries.values()):
+            request.mark_connection_lost()
+        self._task_deliveries.clear()
+
+    def _safe_restore_prefetch_count_after_connection_restart(self, *args, **kwargs):
+        try:
+            self._restore_prefetch_count_after_connection_restart(*args, **kwargs)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception('Failed to restore prefetch count: %r', exc)
 
     def bucket_for_task(self, type):
         limit = rate(getattr(type, 'rate_limit', None))
@@ -419,6 +447,7 @@ class Consumer:
 
     def on_connection_error_after_connected(self, exc):
         warn(CONNECTION_RETRY, exc_info=True)
+        self.mark_task_deliveries_connection_lost()
         # Bound the sockets that are already open before cleanup reads from
         # them; collect()'s socket_timeout only applies to new sockets.
         bound_open_broker_sockets(self.connection, COLLECT_SOCKET_TIMEOUT)
@@ -438,11 +467,12 @@ class Consumer:
 
         if self.app.conf.worker_cancel_long_running_tasks_on_connection_loss:
             for request in tuple(active_requests):
-                if request.task.acks_late and not request.acknowledged:
+                if request.task.acks_late and not _delivery_resolved(request):
                     warn(TERMINATING_TASK_ON_RESTART_AFTER_A_CONNECTION_LOSS,
                          request)
                     try:
-                        request.cancel(self.pool)
+                        request.cancel(self.pool, emit_retry=False,
+                                       connection_lost=True)
                     except Exception:  # pylint: disable=broad-except
                         warn("Failed to cancel active request %r after connection loss", request, exc_info=True)
         else:
@@ -775,15 +805,54 @@ class Consumer:
                 return on_unknown_task(None, message, exc)
             else:
                 try:
-                    ack_log_error_promise = promise(
-                        call_soon_ack,
-                        (message.ack_log_error,),
-                        on_error=self._restore_prefetch_count_after_connection_restart,
+                    ack_operation_promise = promise(message.ack_log_error)
+                    reject_operation_promise = promise(message.reject_log_error)
+                    ack_operation_promise.on_error = promise(
+                        self._safe_restore_prefetch_count_after_connection_restart,
                     )
-                    reject_log_error_promise = promise(
-                        call_soon_ack,
-                        (message.reject_log_error,),
-                        on_error=self._restore_prefetch_count_after_connection_restart,
+                    reject_operation_promise.on_error = promise(
+                        self._safe_restore_prefetch_count_after_connection_restart,
+                    )
+
+                    def _schedule_ack(*args, **kwargs):
+                        scheduled = ack_operation_promise
+                        try:
+                            scheduled = call_soon_ack(
+                                promise(
+                                    ack_operation_promise,
+                                    args=args, kwargs=kwargs,
+                                )
+                            )
+                        except Exception:
+                            ack_operation_promise.failed = True
+                            ack_operation_promise.reason = None
+                            ack_operation_promise.throw1()
+                        return scheduled
+
+                    def _schedule_reject(*args, **kwargs):
+                        scheduled = reject_operation_promise
+                        try:
+                            scheduled = call_soon_ack(
+                                promise(
+                                    reject_operation_promise,
+                                    args=args, kwargs=kwargs,
+                                )
+                            )
+                        except Exception:
+                            reject_operation_promise.failed = True
+                            reject_operation_promise.reason = None
+                            reject_operation_promise.throw1()
+                        return scheduled
+
+                    ack_log_error_promise = promise(_schedule_ack)
+                    reject_log_error_promise = promise(_schedule_reject)
+                    ack_log_error_promise.deferred = self.hub is not None
+                    reject_log_error_promise.deferred = self.hub is not None
+                    ack_log_error_promise.celery_delivery_operation = (
+                        ack_operation_promise
+                    )
+                    reject_log_error_promise.celery_delivery_operation = (
+                        reject_operation_promise
                     )
 
                     if (
@@ -791,10 +860,12 @@ class Consumer:
                         and self.restart_count > 0
                         and self._new_prefetch_count <= self.max_prefetch_count
                     ):
-                        ack_log_error_promise.then(self._restore_prefetch_count_after_connection_restart,
-                                                   on_error=self._restore_prefetch_count_after_connection_restart)
-                        reject_log_error_promise.then(self._restore_prefetch_count_after_connection_restart,
-                                                      on_error=self._restore_prefetch_count_after_connection_restart)
+                        ack_operation_promise.then(
+                            self._safe_restore_prefetch_count_after_connection_restart,
+                        )
+                        reject_operation_promise.then(
+                            self._safe_restore_prefetch_count_after_connection_restart,
+                        )
 
                     strategy(
                         message, payload,
@@ -848,9 +919,9 @@ class Consumer:
         """Cancel active requests during shutdown.
 
         Cancels all active requests that either do not require late acknowledgments or,
-        if they do, have not been acknowledged yet.
+        if they do, do not yet have a terminal broker decision.
 
-        Does not cancel successful tasks, even if they have not been acknowledged yet.
+        Does not cancel successful tasks, even if their decision is still pending.
         """
 
         def should_cancel(request):
@@ -858,15 +929,14 @@ class Consumer:
                 # Task does not require late acknowledgment, cancel it.
                 return True
 
-            if not request.acknowledged:
-                # Task is late acknowledged, but it has not been acknowledged yet, cancel it.
+            if not _delivery_resolved(request):
+                # The broker outcome for this delivery is still open.
                 if request.id in successful_requests:
-                    # Unless it was successful, in which case we don't want to cancel it.
                     return False
                 return True
 
-            # Task is late acknowledged, but it has already been acknowledged.
-            return False  # Do not cancel and allow it to gracefully finish as it has already been acknowledged.
+            # A broker decision exists; do not send a conflicting operation.
+            return False
 
         requests_to_cancel = tuple(filter(should_cancel, active_requests))
 
