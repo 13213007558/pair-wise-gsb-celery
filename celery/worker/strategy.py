@@ -171,6 +171,7 @@ def default(task, app, consumer,
                 args=req.argsrepr, kwargs=req.kwargsrepr,
                 root_id=req.root_id, parent_id=req.parent_id,
                 retries=req.request_dict.get('retries', 0),
+                redelivered=req.delivery_info.get('redelivered', False),
                 eta=req.eta and req.eta.isoformat(),
                 expires=req.expires and req.expires.isoformat(),
             )

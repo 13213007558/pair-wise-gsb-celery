@@ -1949,3 +1949,134 @@ class test_create_request_class(RequestCase):
         assert job._apply_result
         weakref_ref.assert_called_with(self.pool.apply_async())
         assert job._apply_result is weakref_ref()
+
+
+class test_ack_state_machine(RequestCase):
+    """Every delivery reaches exactly one conclusion on the ack line."""
+
+    def test_acknowledge_resolves_once(self):
+        job = self.xRequest()
+        assert job.ack_state == module.ACK_PENDING
+        assert job.acknowledge() is True
+        assert job.acknowledged
+        assert job.ack_state == module.ACK_ACKED
+        job._on_ack.assert_called_once()
+        # a repeated ack is an idempotent no-op
+        assert job.acknowledge() is False
+        job._on_ack.assert_called_once()
+
+    def test_reject_resolves_once(self):
+        job = self.xRequest()
+        assert job.reject(requeue=False) is True
+        assert job.acknowledged
+        assert job.ack_state == module.ACK_REJECTED
+        job._on_reject.assert_called_once()
+        assert job.reject(requeue=False) is False
+        job._on_reject.assert_called_once()
+
+    def test_reject_requeue_state(self):
+        job = self.xRequest()
+        assert job.reject(requeue=True) is True
+        assert job.ack_state == module.ACK_REQUEUED
+        job._on_reject.assert_called_once_with(
+            req_logger, job.connection_errors, True)
+
+    def test_ack_after_reject_is_suppressed(self):
+        job = self.xRequest()
+        job.reject(requeue=True)
+        assert job.acknowledge() is False
+        job._on_ack.assert_not_called()
+        job._on_reject.assert_called_once()
+        assert job.ack_state == module.ACK_REQUEUED
+
+    def test_reject_after_ack_is_suppressed(self):
+        job = self.xRequest()
+        job.acknowledge()
+        assert job.reject(requeue=True) is False
+        job._on_reject.assert_not_called()
+        job._on_ack.assert_called_once()
+        assert job.ack_state == module.ACK_ACKED
+
+    def test_connection_lost_suppresses_late_ack(self):
+        job = self.xRequest()
+        job.on_connection_lost()
+        assert job.acknowledge() is False
+        job._on_ack.assert_not_called()
+        # the broker never got a conclusion: it will redeliver, so the
+        # request must stay unacknowledged.
+        assert not job.acknowledged
+        assert job.ack_state == module.ACK_LOST
+
+    def test_connection_lost_suppresses_late_reject(self):
+        job = self.xRequest()
+        job.on_connection_lost()
+        assert job.reject(requeue=True) is False
+        job._on_reject.assert_not_called()
+        assert not job.acknowledged
+        assert job.ack_state == module.ACK_LOST
+
+    def test_connection_lost_after_ack_is_noop(self):
+        job = self.xRequest()
+        job.acknowledge()
+        job.on_connection_lost()
+        assert job.ack_state == module.ACK_ACKED
+        # and further resolutions are still suppressed
+        assert job.reject(requeue=True) is False
+        job._on_reject.assert_not_called()
+
+    def test_delivery_info_carries_delivery_tag_and_redelivered(self):
+        message = self.TaskMessage(self.mytask.name)
+        message.delivery_info = {
+            'exchange': 'celery',
+            'routing_key': 'celery',
+            'redelivered': True,
+            'delivery_tag': 42,
+        }
+        job = Request(message, app=self.app)
+        assert job.delivery_info['delivery_tag'] == 42
+        assert job.delivery_info['redelivered'] is True
+        # and both are threaded into the request dict sent to the pool
+        assert job.request_dict['delivery_info']['delivery_tag'] == 42
+        assert job.request_dict['delivery_info']['redelivered'] is True
+
+    def test_info_reports_ack_state(self):
+        job = self.xRequest()
+        assert job.info()['ack_state'] == module.ACK_PENDING
+        job.acknowledge()
+        assert job.info()['ack_state'] == module.ACK_ACKED
+
+    def test_revoked_acks_even_if_backend_write_fails(self):
+        job = self.xRequest()
+        job.task.backend = Mock()
+        job.task.backend.mark_as_revoked.side_effect = KeyError('down')
+        revoked.add(job.id)
+        with pytest.raises(KeyError):
+            job.revoked()
+        job._on_ack.assert_called_once()
+        assert job.ack_state == module.ACK_ACKED
+
+    def test_on_timeout_rejects_even_if_backend_write_fails(self):
+        self.mytask.acks_late = True
+        self.mytask.acks_on_timeout = False
+        job = self.xRequest()
+        job.task.backend = Mock()
+        job.task.backend.mark_as_failure.side_effect = KeyError('down')
+        with pytest.raises(KeyError):
+            job.on_timeout(soft=False, timeout=10)
+        job._on_reject.assert_called_once_with(
+            req_logger, job.connection_errors, True)
+        assert job.ack_state == module.ACK_REQUEUED
+
+    def test_on_failure_Reject_rejects_even_if_backend_write_fails(self):
+        try:
+            raise Reject('rejected')
+        except Reject:
+            einfo = ExceptionInfo()
+        job = self.xRequest()
+        job.task.backend = Mock()
+        job.task.backend.mark_as_failure.side_effect = KeyError('down')
+        with pytest.raises(KeyError):
+            job.on_failure(einfo)
+        job._on_reject.assert_called_once_with(
+            req_logger, job.connection_errors, False)
+        assert job.ack_state == module.ACK_REJECTED

@@ -171,6 +171,24 @@ class test_default_strategy_proto2:
             C.consumer.on_task_request.assert_called_with(req)
             assert C.event_sent()
 
+    def test_task_received_event_reports_redelivered(self):
+        with self._context(self.add.s(2, 2)) as C:
+            C.message.delivery_info = {
+                'exchange': 'celery', 'routing_key': 'celery',
+                'redelivered': True, 'delivery_tag': 7,
+            }
+            C()
+            assert C.was_reserved()
+            req = C.get_request()
+            # the redelivery flag and delivery tag follow the request,
+            # so a redelivered message can be correlated with the
+            # delivery that was lost by the previous connection.
+            assert req.delivery_info['redelivered'] is True
+            assert req.delivery_info['delivery_tag'] == 7
+            event = C.event_sent()
+            assert event[0][0] == 'task-received'
+            assert event[1]['redelivered'] is True
+
     def test_callbacks(self):
         with self._context(self.add.s(2, 2)) as C:
             callbacks = [Mock(name='cb1'), Mock(name='cb2')]

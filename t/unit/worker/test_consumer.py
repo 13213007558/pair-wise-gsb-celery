@@ -559,6 +559,77 @@ class test_Consumer(ConsumerTestCase):
             sock.close()
             peer.close()
 
+    def test_marks_inflight_requests_connection_lost(self):
+        """Every unresolved in-flight delivery is marked on reconnect.
+
+        Reserved, scheduled and active requests must all be told about
+        the connection loss so a late ack/reject is not sent to the dead
+        (or recycled) channel.
+        """
+        from celery.worker import state
+
+        c = self.get_consumer()
+        reserved, active, scheduled = Mock(), Mock(), Mock()
+        acked = Mock()
+        state.reset_state()
+        try:
+            state.reserved_requests.add(reserved)
+            state.active_requests.add(active)
+            state.scheduled_requests.add(scheduled)
+            state.active_requests.add(acked)
+            # a request in several sets is only marked once
+            state.reserved_requests.add(active)
+            c.on_connection_error_after_connected(Mock())
+        finally:
+            state.reset_state()
+        reserved.on_connection_lost.assert_called_once_with()
+        active.on_connection_lost.assert_called_once_with()
+        scheduled.on_connection_lost.assert_called_once_with()
+        # the consumer notifies every in-flight request; the Request
+        # itself ignores the mark when it already resolved the delivery
+        # (see test_ack_state_machine).
+        acked.on_connection_lost.assert_called_once_with()
+
+    def test_late_ack_after_connection_loss_is_suppressed(self):
+        """A delivery whose channel died is never acked after reconnect.
+
+        The broker will redeliver the message, so the request stays
+        unacknowledged and its resolution is recorded as lost.
+        """
+        from celery.worker import state
+        from celery.worker.request import ACK_LOST, Request
+        from celery.contrib.testing.mocks import TaskMessage
+
+        @self.app.task(shared=False)
+        def acks_late_task():
+            return 1
+        acks_late_task.acks_late = True
+
+        message = TaskMessage(acks_late_task.name)
+        message.delivery_info = {
+            'exchange': 'celery', 'routing_key': 'celery',
+            'redelivered': False, 'delivery_tag': 1,
+        }
+        on_ack, on_reject = Mock(name='on_ack'), Mock(name='on_reject')
+        req = Request(message, app=self.app, on_ack=on_ack,
+                      on_reject=on_reject)
+        req.time_start = 1  # task already started when the broker drops
+
+        c = self.get_consumer()
+        state.reset_state()
+        try:
+            state.active_requests.add(req)
+            c.on_connection_error_after_connected(Mock())
+            # the task finishes after the reconnect: no ack may be sent
+            assert req.acknowledge() is False
+            assert req.reject(requeue=True) is False
+        finally:
+            state.reset_state()
+        on_ack.assert_not_called()
+        on_reject.assert_not_called()
+        assert not req.acknowledged
+        assert req.ack_state == ACK_LOST
+
     def test_register_with_event_loop(self):
         c = self.get_consumer()
         c.register_with_event_loop(Mock(name='loop'))

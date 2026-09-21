@@ -436,6 +436,15 @@ class Consumer:
         if connection:
             ignore_errors(connection, connection.close)
 
+        # The channel is gone, so every prefetched delivery that has not
+        # been resolved yet stays unacknowledged on the broker side and
+        # will be redelivered (with the redelivered flag set).  Mark the
+        # matching requests so a completion, timeout or revoke racing the
+        # reconnect cannot emit a late ack/reject for a delivery tag the
+        # broker has already discarded -- that would either hit the dead
+        # channel or, worse, alias a different delivery on the new one.
+        self._mark_inflight_requests_connection_lost()
+
         if self.app.conf.worker_cancel_long_running_tasks_on_connection_loss:
             for request in tuple(active_requests):
                 if request.task.acks_late and not request.acknowledged:
@@ -494,6 +503,30 @@ class Consumer:
             self, 'register_with_event_loop', args=(hub,),
             description='Hub.register',
         )
+
+    def _mark_inflight_requests_connection_lost(self):
+        """Suppress late acks/rejects for deliveries of the lost channel.
+
+        Every prefetched message that has not been resolved on the
+        ack/reject line yet (reserved, scheduled for an ETA, or actively
+        executing) will be redelivered by the broker; the requests are
+        marked so their eventual resolution is recorded as lost instead of
+        being sent to a dead or recycled channel.  Requests that already
+        sent their ack are left untouched.
+        """
+        seen = set()
+        for requests_ in (reserved_requests, active_requests,
+                          scheduled_requests):
+            for request in tuple(requests_):
+                if id(request) in seen:
+                    continue
+                seen.add(id(request))
+                try:
+                    request.on_connection_lost()
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception(
+                        'Failed to mark request %r as connection-lost',
+                        request)
 
     def shutdown(self):
         self.perform_pending_operations()

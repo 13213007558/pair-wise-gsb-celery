@@ -362,6 +362,11 @@ class Inspect:
                 * ``routing_key`` - Routing key used when task was published
                 * ``priority`` - Priority used when task was published
                 * ``redelivered`` - True if the task was redelivered
+                * ``delivery_tag`` - Delivery tag assigned by the broker
+            * ``ack_state`` - Resolution of the delivery on the ack line:
+                one of ``PENDING``, ``ACKED``, ``REJECTED``, ``REQUEUED``
+                or ``LOST`` (broker connection lost before a conclusion
+                was sent; the message will be redelivered)
             * ``worker_pid`` - PID of worker processing the task
 
         """

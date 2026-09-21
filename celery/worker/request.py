@@ -36,6 +36,23 @@ __all__ = ('Request',)
 
 IS_PYPY = hasattr(sys, 'pypy_version_info')
 
+#: Resolution states of a single delivery on the ack/reject line.
+#:
+#: Every prefetched message must reach exactly one terminal resolution:
+#: ``basic.ack`` (:const:`ACK_ACKED`), ``basic.reject`` with
+#: ``requeue=False`` (:const:`ACK_REJECTED`), ``basic.reject`` with
+#: ``requeue=True`` (:const:`ACK_REQUEUED`), or no resolution at all
+#: because the broker connection was lost first (:const:`ACK_LOST`), in
+#: which case the broker will redeliver the message.  The framework records
+#: the resolution so that a delivery is never sent two contradictory
+#: operations, and so that a resolution lost to a broker disconnect is
+#: distinguishable from one the broker may have confirmed.
+ACK_PENDING = 'PENDING'
+ACK_ACKED = 'ACKED'
+ACK_REJECTED = 'REJECTED'
+ACK_REQUEUED = 'REQUEUED'
+ACK_LOST = 'LOST'
+
 logger = get_logger(__name__)
 debug, info, warn, error = (logger.debug, logger.info,
                             logger.warning, logger.error)
@@ -76,6 +93,8 @@ class Request:
     _terminate_on_ack = None
     _apply_result = None
     _tzlocal = None
+    _ack_state = ACK_PENDING
+    _connection_lost = False
 
     #: Timer entry for this request's pending ETA/countdown callback, set by
     #: :mod:`celery.worker.strategy` when the request is scheduled so that
@@ -167,6 +186,7 @@ class Request:
             'routing_key': delivery_info.get('routing_key'),
             'priority': properties.get('priority'),
             'redelivered': delivery_info.get('redelivered', False),
+            'delivery_tag': delivery_info.get('delivery_tag'),
         }
         self._request_dict.update({
             'properties': properties,
@@ -183,6 +203,17 @@ class Request:
     @property
     def delivery_info(self):
         return self._delivery_info
+
+    @property
+    def ack_state(self):
+        """Terminal resolution of this delivery on the ack/reject line.
+
+        One of ``PENDING`` (no conclusion yet), ``ACKED``, ``REJECTED``,
+        ``REQUEUED`` or ``LOST`` (the broker connection was lost before a
+        conclusion could be sent, so the broker will redeliver the
+        message).  See the ``ACK_*`` module constants.
+        """
+        return self._ack_state
 
     @property
     def message(self):
@@ -464,11 +495,15 @@ class Request:
         task_ready(self)
         self.send_event('task-revoked',
                         terminated=terminated, signum=signum, expired=expired)
-        self.task.backend.mark_as_revoked(
-            self.id, reason, request=self._context,
-            store_result=self.store_errors,
-        )
-        self.acknowledge()
+        try:
+            self.task.backend.mark_as_revoked(
+                self.id, reason, request=self._context,
+                store_result=self.store_errors,
+            )
+        finally:
+            # A result-backend write failure must not change the
+            # resolution of the delivery on the ack line.
+            self.acknowledge()
         self._already_revoked = True
         send_revoked(self.task, request=self._context,
                      terminated=terminated, signum=signum, expired=expired)
@@ -541,73 +576,79 @@ class Request:
             task_ready(self)
             # This is a special case where the task timeout handling is done during
             # the cold shutdown process.
-            if not state.should_terminate:
-                error('Hard time limit (%ss) exceeded for %s[%s]', timeout, self.name, self.id)
-                exc = TimeLimitExceeded(timeout)
+            try:
+                if not state.should_terminate:
+                    self._record_timeout_failure(timeout)
+            finally:
+                # The delivery must reach its conclusion on the ack line
+                # even if recording the result in the backend failed.
+                if self.task.acks_late:
+                    if self.task.acks_on_timeout:
+                        self.acknowledge()
+                    else:
+                        self.reject(requeue=True)
 
-                self.task.backend.mark_as_failure(
-                    self.id, exc, request=self._context,
-                    store_result=self.store_errors,
+    def _record_timeout_failure(self, timeout):
+        error('Hard time limit (%ss) exceeded for %s[%s]', timeout, self.name, self.id)
+        exc = TimeLimitExceeded(timeout)
+
+        self.task.backend.mark_as_failure(
+            self.id, exc, request=self._context,
+            store_result=self.store_errors,
+        )
+
+        # Invoke the same failure hooks that a normal task failure
+        # triggers so that on_failure callbacks, errbacks, and
+        # the task_failure signal all fire for hard timeouts.
+        einfo = None
+        try:
+            try:
+                raise exc
+            except TimeLimitExceeded:
+                einfo = ExceptionInfo()
+
+            self.task.on_failure(exc, self.id, self.args, self.kwargs, einfo)
+
+            if task_has_custom(self.task, 'after_return'):
+                self.task.after_return(
+                    states.FAILURE, exc, self.id, self.args, self.kwargs, None,
                 )
 
-                # Invoke the same failure hooks that a normal task failure
-                # triggers so that on_failure callbacks, errbacks, and
-                # the task_failure signal all fire for hard timeouts.
-                einfo = None
-                try:
-                    try:
-                        raise exc
-                    except TimeLimitExceeded:
-                        einfo = ExceptionInfo()
+            signals.task_failure.send(
+                sender=self.task,
+                task_id=self.id,
+                exception=exc,
+                args=self.args,
+                kwargs=self.kwargs,
+                traceback=exc.__traceback__,
+                einfo=einfo,
+            )
 
-                    self.task.on_failure(exc, self.id, self.args, self.kwargs, einfo)
-
-                    if task_has_custom(self.task, 'after_return'):
-                        self.task.after_return(
-                            states.FAILURE, exc, self.id, self.args, self.kwargs, None,
-                        )
-
-                    signals.task_failure.send(
-                        sender=self.task,
-                        task_id=self.id,
-                        exception=exc,
-                        args=self.args,
-                        kwargs=self.kwargs,
-                        traceback=exc.__traceback__,
-                        einfo=einfo,
-                    )
-
-                    self.send_event(
-                        'task-failed',
-                        exception=safe_repr(get_pickled_exception(einfo.exception)),
-                        traceback=einfo.traceback,
-                    )
-                finally:
-                    # Break the exc → traceback → frame reference cycle
-                    # (this frame's own `exc` local points at exc, and
-                    # exc.__traceback__ points back at this frame) so the
-                    # on_timeout frame — and the Request/self it holds —
-                    # can be garbage-collected promptly.
-                    #
-                    # Note: a `traceback_clear(exc)` call previously lived
-                    # here too, but it is a guaranteed no-op in this
-                    # location: exc is raised and caught within this same
-                    # function, so the only frame in exc.__traceback__ is
-                    # this currently-executing frame, and CPython's
-                    # frame.clear() always raises "cannot clear an
-                    # executing frame" for a frame still on the call
-                    # stack. That RuntimeError was being silently
-                    # swallowed inside traceback_clear(), so the call
-                    # appeared to succeed while doing nothing.
-                    if einfo is not None:
-                        del einfo
-                    exc.__traceback__ = None
-
-            if self.task.acks_late:
-                if self.task.acks_on_timeout:
-                    self.acknowledge()
-                else:
-                    self.reject(requeue=True)
+            self.send_event(
+                'task-failed',
+                exception=safe_repr(get_pickled_exception(einfo.exception)),
+                traceback=einfo.traceback,
+            )
+        finally:
+            # Break the exc → traceback → frame reference cycle
+            # (this frame's own `exc` local points at exc, and
+            # exc.__traceback__ points back at this frame) so the
+            # on_timeout frame — and the Request/self it holds —
+            # can be garbage-collected promptly.
+            #
+            # Note: a `traceback_clear(exc)` call previously lived
+            # here too, but it is a guaranteed no-op in this
+            # location: exc is raised and caught within this same
+            # function, so the only frame in exc.__traceback__ is
+            # this currently-executing frame, and CPython's
+            # frame.clear() always raises "cannot clear an
+            # executing frame" for a frame still on the call
+            # stack. That RuntimeError was being silently
+            # swallowed inside traceback_clear(), so the call
+            # appeared to succeed while doing nothing.
+            if einfo is not None:
+                del einfo
+            exc.__traceback__ = None
 
     def on_success(self, failed__retval__runtime, **kwargs):
         """Handler called if the task was successfully processed."""
@@ -680,22 +721,28 @@ class Request:
                 # never run again, so record a terminal FAILURE result and
                 # fire the task_failure signal instead of leaving the task
                 # stuck in PENDING/STARTED forever (Issue #4222).
-                self.task.backend.mark_as_failure(
-                    self.id, exc, request=self._context,
-                    store_result=self.store_errors,
-                )
-                signals.task_failure.send(
-                    sender=self.task, task_id=self.id, exception=exc,
-                    args=self.args, kwargs=self.kwargs,
-                    traceback=exc_info.traceback, einfo=exc_info,
-                )
-                if send_failed_event:
-                    self.send_event(
-                        'task-failed',
-                        exception=safe_repr(
-                            get_pickled_exception(exc_info.exception)),
-                        traceback=exc_info.traceback,
+                try:
+                    self.task.backend.mark_as_failure(
+                        self.id, exc, request=self._context,
+                        store_result=self.store_errors,
                     )
+                    signals.task_failure.send(
+                        sender=self.task, task_id=self.id, exception=exc,
+                        args=self.args, kwargs=self.kwargs,
+                        traceback=exc_info.traceback, einfo=exc_info,
+                    )
+                    if send_failed_event:
+                        self.send_event(
+                            'task-failed',
+                            exception=safe_repr(
+                                get_pickled_exception(exc_info.exception)),
+                            traceback=exc_info.traceback,
+                        )
+                finally:
+                    # A result-backend write failure must not prevent the
+                    # delivery from reaching its conclusion on the ack line.
+                    self.reject(requeue=False)
+                return
             return self.reject(requeue=exc.requeue)
         elif isinstance(exc, Ignore):
             return self.acknowledge()
@@ -771,16 +818,74 @@ class Request:
             return ExceptionInfo()
 
     def acknowledge(self):
-        """Acknowledge task."""
-        if not self.acknowledged:
-            self._on_ack(logger, self._connection_errors)
-            self.acknowledged = True
+        """Acknowledge task.
+
+        Returns True only when the ack was actually handed to the broker
+        connection.  A delivery resolves exactly once: a call arriving
+        after the delivery was rejected, or after the broker connection
+        was lost, is suppressed so the same delivery is never sent two
+        contradictory operations.
+        """
+        if self.acknowledged:
+            if self._ack_state != ACK_ACKED:
+                warn('Ignoring ack for %s: delivery already resolved as %s',
+                     self.humaninfo(), self._ack_state)
+            return False
+        if self._connection_lost:
+            return self._resolve_connection_lost('ack')
+        self._on_ack(logger, self._connection_errors)
+        self.acknowledged = True
+        self._ack_state = ACK_ACKED
+        return True
 
     def reject(self, requeue=False):
+        """Reject task.
+
+        Same single-resolution contract as :meth:`acknowledge`: returns
+        True only when the reject was actually handed to the broker
+        connection.
+        """
+        if self.acknowledged:
+            wanted = ACK_REQUEUED if requeue else ACK_REJECTED
+            if self._ack_state != wanted:
+                warn('Ignoring reject (requeue=%r) for %s: '
+                     'delivery already resolved as %s',
+                     requeue, self.humaninfo(), self._ack_state)
+            return False
+        if self._connection_lost:
+            return self._resolve_connection_lost(
+                'reject (requeue=%r)' % (requeue,))
+        self._on_reject(logger, self._connection_errors, requeue)
+        self.acknowledged = True
+        self._ack_state = ACK_REQUEUED if requeue else ACK_REJECTED
+        self.send_event('task-rejected', requeue=requeue)
+        return True
+
+    def on_connection_lost(self):
+        """Mark that the broker connection carrying this delivery was lost.
+
+        Called by the consumer when the connection drops while this request
+        is still in flight (reserved, scheduled or active).  The
+        unacknowledged message stays with the broker, which will redeliver
+        it (with the 'redelivered' flag set); any late ack/reject for
+        this delivery is suppressed, since the delivery tag is only valid
+        on the dead channel and would be meaningless -- or worse, alias a
+        different delivery -- on the new one.
+        """
         if not self.acknowledged:
-            self._on_reject(logger, self._connection_errors, requeue)
-            self.acknowledged = True
-            self.send_event('task-rejected', requeue=requeue)
+            self._connection_lost = True
+
+    def _resolve_connection_lost(self, operation):
+        # The channel this delivery arrived on is gone, so the broker never
+        # received (and never will receive) a conclusion for it: it will
+        # redeliver the message.  Record the lost resolution instead of
+        # writing to a dead or recycled channel, and keep the request
+        # unacknowledged so shutdown logic still treats it as pending
+        # redelivery.
+        self._ack_state = ACK_LOST
+        info('Not sending %s for %s: broker connection was lost, '
+             'message will be redelivered', operation, self.humaninfo())
+        return False
 
     def info(self, safe=False):
         return {
@@ -793,6 +898,7 @@ class Request:
             'time_start': self.time_start,
             'acknowledged': self.acknowledged,
             'delivery_info': self.delivery_info,
+            'ack_state': self.ack_state,
             'worker_pid': self.worker_pid,
         }
 
