@@ -310,20 +310,20 @@ class test_Scheduler:
         s = mScheduler(app=self.app)
         entry = s.Entry(name='a name', task='foo', app=self.app)
 
-        with patch.object(s, 'apply_async') as mock_apply_async:
+        with patch.object(s, '_send_entry') as mock_apply_async:
             with patch("celery.beat.debug") as mock_debug:
                 mock_apply_async.return_value = None
                 s.apply_entry(entry)
         mock_debug.assert_called_once_with('%s sent.', entry.task)
 
-        with patch.object(s, 'apply_async') as mock_apply_async:
+        with patch.object(s, '_send_entry') as mock_apply_async:
             with patch("celery.beat.debug") as mock_debug:
                 mock_apply_async.return_value = object()
                 s.apply_entry(entry)
         mock_debug.assert_called_once_with('%s sent.', entry.task)
 
         task_id = 'taskId123456'
-        with patch.object(s, 'apply_async') as mock_apply_async:
+        with patch.object(s, '_send_entry') as mock_apply_async:
             with patch("celery.beat.debug") as mock_debug:
                 mock_apply_async.return_value = self.app.AsyncResult(task_id)
                 s.apply_entry(entry)
@@ -457,6 +457,250 @@ class test_Scheduler:
         scheduler.add(name='test_schedule', schedule=schedule(10))
         scheduler.tick()
         assert scheduler._heap[0].entry.schedule == schedule_10
+
+    def test_tick_rebuilds_heap_when_schedule_dict_is_replaced(self):
+        scheduler = mScheduler(app=self.app)
+        entry = scheduler.add(name='old', task='t.old', schedule=always_pending)
+        scheduler.tick()
+
+        replacement = scheduler.Entry(
+            name='new', task='t.new', schedule=always_due, app=self.app,
+        )
+        scheduler.schedule = {'new': replacement}
+        scheduler.tick()
+
+        assert [item['name'] for item in scheduler.sent] == ['t.new']
+        assert all(event.entry is not entry for event in scheduler._heap)
+
+    def test_tick_reload_after_reserve_uses_generation_once(self):
+        scheduler = mScheduler(app=self.app)
+        entry = scheduler.add(name='reload_race', task='t.reloaded',
+                              schedule=always_due)
+        scheduler.tick()
+
+        updated = scheduler.Entry(
+            name='reload_race', task='t.reloaded',
+            schedule=schedule(10, app=self.app), app=self.app,
+        )
+        scheduler.schedule['reload_race'] = updated
+        scheduler.tick()
+
+        assert [item['name'] for item in scheduler.sent] == ['t.reloaded']
+        assert scheduler.schedule['reload_race'] is updated
+        assert updated.generation > entry.generation
+        assert all(
+            item.entry.generation == entry.generation
+            for item in scheduler._dispatches.values()
+        ) or not scheduler._dispatches
+
+    def test_tick_reload_while_reserved_does_not_send_new_generation(self):
+        app = self.app
+
+        class FlakyThenOkScheduler(mScheduler):
+            def __init__(self):
+                self.allow_send = False
+                super().__init__(app=app)
+
+            def send_task(self, name=None, args=None, kwargs=None, **options):
+                if not self.allow_send:
+                    raise beat.SchedulingError('broker unavailable')
+                return super().send_task(name, args, kwargs, **options)
+
+        scheduler = FlakyThenOkScheduler()
+        old = scheduler.add(name='reload_pending', task='t.old',
+                            schedule=always_due)
+        scheduler.tick()
+
+        updated = scheduler.Entry(
+            name='reload_pending', task='t.new', schedule=always_due,
+            app=self.app,
+        )
+        scheduler.schedule['reload_pending'] = updated
+        scheduler.allow_send = True
+        scheduler._dispatch_retried_at['reload_pending'] = 0
+        scheduler.tick()
+
+        assert [item['name'] for item in scheduler.sent] == ['t.old']
+        assert scheduler.sent[0]['options']['headers'][
+            'celery_beat_generation'] == old.generation
+        assert scheduler.schedule['reload_pending'] is updated
+
+    def test_tick_deleted_entry_does_not_return_from_heap(self):
+        scheduler = mScheduler(app=self.app)
+        scheduler.add(name='removed', task='t.removed', schedule=always_due)
+        scheduler.tick()
+
+        scheduler.schedule.pop('removed')
+        scheduler.tick()
+
+        assert [item['name'] for item in scheduler.sent] == ['t.removed']
+        assert all(event.entry.name != 'removed' for event in scheduler._heap)
+
+    def test_tick_send_failure_retries_reserved_entry(self):
+        class FlakyScheduler(mScheduler):
+            def send_task(self, name=None, args=None, kwargs=None, **options):
+                self.attempt = getattr(self, 'attempt', 0) + 1
+                if self.attempt == 1:
+                    raise beat.SchedulingError('broker unavailable')
+                return super().send_task(name, args, kwargs, **options)
+
+        scheduler = FlakyScheduler(app=self.app)
+        scheduler.add(name='flaky', task='t.flaky', schedule=always_due)
+        scheduler.tick()
+
+        assert scheduler.attempt == 1
+        dispatch = scheduler._dispatches['flaky']
+        assert dispatch.attempts == 1
+        assert dispatch.entry.generation == 1
+
+        scheduler.schedule['flaky'].generation = 2
+        scheduler._dispatch_retried_at['flaky'] = 0
+        scheduler.tick()
+
+        assert [item['name'] for item in scheduler.sent] == ['t.flaky']
+        assert scheduler.sent[0]['options']['headers'][
+            'celery_beat_generation'] == 1
+        assert 'flaky' not in scheduler._dispatches
+
+    def test_tick_ack_failure_keeps_sent_state_without_second_send(self):
+        class AckFailingScheduler(mScheduler):
+            state_calls = 0
+
+            def _persist_dispatches(self):
+                pass
+
+            def _persist_dispatch_state(self):
+                self.state_calls += 1
+                if self.state_calls > 2:
+                    raise OSError('disk unavailable')
+
+        scheduler = AckFailingScheduler(app=self.app)
+        scheduler.add(name='ack', task='t.ack', schedule=always_due)
+
+        assert scheduler.tick() == 0
+        assert len(scheduler.sent) == 1
+        dispatch = scheduler._dispatches['ack']
+        assert dispatch.sent is True
+
+        scheduler._dispatch_retried_at['ack'] = 0
+        assert scheduler.tick() > 0
+        assert len(scheduler.sent) == 1
+
+    def test_reservation_persistence_failure_rolls_back_and_retries(self):
+        class PersistFailingScheduler(mScheduler):
+            persist_calls = 0
+
+            def _persist_dispatches(self):
+                self.persist_calls += 1
+                if self.persist_calls == 1:
+                    raise OSError('disk unavailable')
+
+        scheduler = PersistFailingScheduler(app=self.app)
+        entry = scheduler.add(name='persist_race', task='t.persist',
+                              schedule=always_due)
+        delay = scheduler.tick()
+
+        assert delay > 0
+        assert scheduler.sent == []
+        assert scheduler._dispatches == {}
+        assert scheduler.schedule['persist_race'] is entry
+
+        scheduler.tick()
+        assert [item['name'] for item in scheduler.sent] == ['t.persist']
+
+    def test_reservation_state_persistence_failure_keeps_durable_intent(self):
+        class StatePersistFailingScheduler(mScheduler):
+            calls = 0
+
+            def _persist_dispatches(self):
+                pass
+
+            def _persist_dispatch_state(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise OSError('disk unavailable')
+
+        scheduler = StatePersistFailingScheduler(app=self.app)
+        entry = scheduler.add(name='state_persist', task='t.state',
+                              schedule=always_due)
+        delay = scheduler.tick()
+
+        assert delay > 0
+        assert scheduler.sent == []
+        assert scheduler.schedule['state_persist'] is entry
+        assert 'state_persist' in scheduler._dispatches
+
+        scheduler.tick()
+        assert [item['name'] for item in scheduler.sent] == ['t.state']
+        assert 'state_persist' not in scheduler._dispatches
+
+    def test_do_sync_failure_preserves_task_counter(self):
+        scheduler = mScheduler(app=self.app)
+        scheduler.sync = Mock(side_effect=OSError('disk unavailable'))
+        scheduler._tasks_since_sync = 2
+
+        with pytest.raises(OSError):
+            scheduler._do_sync()
+
+        assert scheduler._tasks_since_sync == 2
+        assert scheduler._last_sync is None
+
+    def test_entry_next_preserves_generation_and_bumps_version(self):
+        entry = beat.ScheduleEntry(
+            name='entry', task='task', schedule=schedule(10),
+            app=self.app, generation=3, version=7,
+        )
+
+        next_entry = next(entry)
+
+        assert next_entry.generation == 3
+        assert next_entry.version == 8
+        assert next_entry.total_run_count == 1
+
+    def test_update_bumps_generation_without_changing_state(self):
+        entry = beat.ScheduleEntry(
+            name='entry', task='task', schedule=schedule(10),
+            app=self.app, generation=2, version=5,
+        )
+        replacement = beat.ScheduleEntry(
+            name='entry', task='new-task', schedule=schedule(20),
+            app=self.app,
+        )
+
+        entry.update(replacement)
+
+        assert entry.generation == 3
+        assert entry.version == 5
+        assert entry.total_run_count == 0
+
+    def test_tick_last_run_change_uses_new_generation(self):
+        scheduler = mScheduler(app=self.app)
+        scheduler.add(name='changed_state', task='t.state',
+                       schedule=schedule(10, app=self.app))
+        scheduler.tick()
+
+        current = scheduler.schedule['changed_state']
+        generation = current.generation
+        current.last_run_at = current.default_now() - timedelta(minutes=10)
+        scheduler.tick()
+
+        assert current.generation == generation + 1
+        assert [item['name'] for item in scheduler.sent] == ['t.state']
+
+    def test_tick_clock_rollback_uses_entry_state_without_duplicate(self):
+        clock = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+        scheduler = mScheduler(app=self.app)
+        sched = schedule(60, nowfun=lambda: clock[0], app=self.app)
+        scheduler.add(name='clock', task='t.clock', schedule=sched,
+                      last_run_at=clock[0] - timedelta(seconds=60))
+
+        scheduler.tick()
+        assert len(scheduler.sent) == 1
+
+        clock[0] -= timedelta(minutes=5)
+        scheduler.tick()
+
+        assert len(scheduler.sent) == 1
 
     def test_schedule_no_remain(self):
         scheduler = mScheduler(app=self.app)
@@ -611,7 +855,10 @@ class test_Scheduler:
             {'foo': {'schedule': mocked_schedule(True, 10)}}
         )
         scheduler.populate_heap()
-        assert scheduler._heap == [event_t(1, 5, scheduler.schedule['foo'])]
+        entry = scheduler.schedule['foo']
+        assert scheduler._heap == [
+            event_t(1, 5, entry, entry.generation, entry.version)
+        ]
 
     def create_schedule_entry(self, schedule=None, args=(), kwargs={},
                               options={}, task=None):
@@ -918,17 +1165,19 @@ class test_PersistentScheduler:
         s._store = {'__version__': 1}
         s.setup_schedule()
 
-        s._store.clear = Mock()
+        s.sync = Mock()
         op = s.persistence.open = Mock()
         op.return_value = s._store
         s._store['tz'] = 'FUNKY'
         s.setup_schedule()
         op.assert_called_with(s.schedule_filename, writeback=True)
-        s._store.clear.assert_called_with()
+        assert all(entry.generation > 1 for entry in s.schedule.values())
+        s.sync.assert_called()
         s._store['utc_enabled'] = False
-        s._store.clear = Mock()
+        s.sync = Mock()
         s.setup_schedule()
-        s._store.clear.assert_called_with()
+        assert all(entry.generation > 2 for entry in s.schedule.values())
+        s.sync.assert_called()
 
     def test_get_schedule(self):
         s = create_persistent_scheduler()[0](
@@ -991,6 +1240,90 @@ class test_PersistentScheduler:
             item['task'] for item in scheduler.sent}
         # ensure next call on the beginning of next min
         assert abs(60 - cur_seconds - delay) < 1
+
+    def test_pending_dispatch_is_retried_after_restart(self):
+        scheduler_class, shelve = create_persistent_scheduler_w_call_logging()
+        now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        sched = schedule(timedelta(seconds=60), nowfun=lambda: now,
+                         app=self.app)
+        self.app.conf.beat_schedule = {
+            'retry': {'task': 'retry', 'schedule': sched},
+        }
+        entry = beat.ScheduleEntry(
+            'retry', 'retry', last_run_at=now - timedelta(seconds=60),
+            total_run_count=0, app=self.app, schedule=sched,
+        )
+        shelve['tz'] = 'UTC'
+        shelve['utc_enabled'] = True
+        shelve['__version__'] = __version__
+        shelve['entries'] = {'retry': entry}
+        shelve['pending_dispatches'] = {
+            'retry': beat.dispatch_t(entry=entry),
+        }
+
+        scheduler = scheduler_class(self.app)
+        scheduler.tick()
+
+        assert [item['task'] for item in scheduler.sent] == ['retry']
+        assert 'retry' not in scheduler._dispatches
+        assert scheduler.schedule['retry'].version == 1
+        assert scheduler.schedule['retry'].total_run_count == 1
+
+        scheduler.tick()
+        assert len(scheduler.sent) == 1
+
+    def test_pending_dispatch_after_restart_keeps_old_generation_header(self):
+        scheduler_class, shelve = create_persistent_scheduler_w_call_logging()
+        now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        sched = schedule(timedelta(seconds=60), nowfun=lambda: now,
+                         app=self.app)
+        self.app.conf.beat_schedule = {
+            'retry': {'task': 'retry', 'schedule': sched},
+        }
+        entry = beat.ScheduleEntry(
+            'retry', 'retry', last_run_at=now - timedelta(seconds=60),
+            app=self.app, schedule=sched, generation=4, version=7,
+        )
+        shelve['tz'] = 'UTC'
+        shelve['utc_enabled'] = True
+        shelve['__version__'] = __version__
+        shelve['entries'] = {'retry': entry}
+        shelve['pending_dispatches'] = {
+            'retry': beat.dispatch_t(entry=entry),
+        }
+
+        scheduler = scheduler_class(self.app)
+        scheduler.tick()
+
+        assert scheduler.sent[0]['options']['headers'][
+            'celery_beat_generation'] == 4
+
+    def test_deleted_pending_dispatch_is_sent_once_after_restart(self):
+        scheduler_class, shelve = create_persistent_scheduler_w_call_logging()
+        now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        sched = schedule(timedelta(seconds=60), nowfun=lambda: now,
+                         app=self.app)
+        self.app.conf.beat_schedule = {}
+        entry = beat.ScheduleEntry(
+            'removed', 'removed', last_run_at=now - timedelta(seconds=60),
+            app=self.app, schedule=sched,
+        )
+        shelve['tz'] = 'UTC'
+        shelve['utc_enabled'] = True
+        shelve['__version__'] = __version__
+        shelve['entries'] = {'removed': entry}
+        shelve['pending_dispatches'] = {
+            'removed': beat.dispatch_t(entry=entry),
+        }
+
+        scheduler = scheduler_class(self.app)
+        scheduler.tick()
+        scheduler.tick()
+
+        assert [item['task'] for item in scheduler.sent] == ['removed']
+        assert 'removed' not in scheduler.schedule
+        assert 'removed' not in scheduler._dispatches
+        assert not scheduler._heap
 
 
 class test_Service:
