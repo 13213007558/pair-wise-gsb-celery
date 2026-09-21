@@ -14,7 +14,7 @@ from celery import signals
 from celery.utils.nodenames import anon_nodename
 from celery.utils.saferepr import saferepr
 from celery.utils.text import indent as textindent
-from celery.utils.time import maybe_make_aware
+from celery.utils.time import is_naive, maybe_iso8601, maybe_make_aware
 
 from . import routes as _routes
 
@@ -340,20 +340,32 @@ class AMQP:
             raise TypeError('task args must be a list or tuple')
         if not isinstance(kwargs, Mapping):
             raise TypeError('task keyword arguments must be a mapping')
+        message_tz = timezone or self.app.timezone
+
+        def message_time(value):
+            if isinstance(value, str) or is_naive(value):
+                value = maybe_iso8601(value)
+                value = maybe_make_aware(
+                    value, message_tz, naive_as_utc=False,
+                )
+            return value
+
         if countdown:  # convert countdown to ETA
             self._verify_seconds(countdown, 'countdown')
             now = now or self.app.now()
-            timezone = timezone or self.app.timezone
             eta = maybe_make_aware(
-                now + timedelta(seconds=countdown), tz=timezone,
+                now + timedelta(seconds=countdown), tz=message_tz,
+                naive_as_utc=self.utc,
             )
         if isinstance(expires, numbers.Real):
             self._verify_seconds(expires, 'expires')
             now = now or self.app.now()
-            timezone = timezone or self.app.timezone
             expires = maybe_make_aware(
-                now + timedelta(seconds=expires), tz=timezone,
+                now + timedelta(seconds=expires), tz=message_tz,
+                naive_as_utc=self.utc,
             )
+        eta = message_time(eta) if eta is not None else None
+        expires = message_time(expires) if expires is not None else None
         if not isinstance(eta, str):
             eta = eta and eta.isoformat()
         # If we retry a task `expires` will already be ISO8601-formatted.
@@ -376,6 +388,7 @@ class AMQP:
             'shadow': shadow,
             'eta': eta,
             'expires': expires,
+            'utc': self.utc,
             'group': group_id,
             'group_index': group_index,
             'retries': retries,
@@ -436,11 +449,21 @@ class AMQP:
         if countdown:  # convert countdown to ETA
             self._verify_seconds(countdown, 'countdown')
             now = now or self.app.now()
-            eta = now + timedelta(seconds=countdown)
+            eta = maybe_make_aware(
+                now + timedelta(seconds=countdown), self.app.timezone,
+                naive_as_utc=self.utc,
+            )
         if isinstance(expires, numbers.Real):
             self._verify_seconds(expires, 'expires')
             now = now or self.app.now()
-            expires = now + timedelta(seconds=expires)
+            expires = maybe_make_aware(
+                now + timedelta(seconds=expires), self.app.timezone,
+                naive_as_utc=self.utc,
+            )
+        if eta is not None and is_naive(eta):
+            eta = maybe_make_aware(eta, self.app.timezone, False)
+        if expires is not None and is_naive(expires):
+            expires = maybe_make_aware(expires, self.app.timezone, False)
         eta = eta and eta.isoformat()
         expires = expires and expires.isoformat()
 

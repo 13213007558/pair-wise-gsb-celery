@@ -35,7 +35,8 @@ __all__ = (
     'delta_resolution', 'remaining', 'rate', 'weekday',
     'humanize_seconds', 'maybe_iso8601', 'is_naive',
     'make_aware', 'localize', 'to_utc', 'maybe_make_aware',
-    'ffwd', 'utcoffset', 'adjust_timestamp',
+    'ffwd', 'utcoffset', 'adjust_timestamp', 'to_epoch',
+    'to_timer_timestamp', 'to_display_timezone', 'is_expired',
     'get_exponential_backoff_interval',
 )
 
@@ -398,11 +399,53 @@ def maybe_make_aware(dt: datetime, tz: tzinfo | None = None,
     """Convert dt to aware datetime, do nothing if dt is already aware."""
     if is_naive(dt):
         if naive_as_utc:
-            dt = to_utc(dt)
-        return localize(
-            dt, timezone.utc if tz is None else timezone.tz_or_local(tz),
-        )
+            return to_utc(dt)
+        return localize(dt, timezone.tz_or_local(tz))
     return dt
+
+
+def to_epoch(dt: datetime, naive_as_utc: bool = True) -> float:
+    """Return the POSIX timestamp represented by ``dt``.
+
+    Aware datetimes are converted by their exact UTC offset. Naive datetimes
+    use the same explicit rule as :func:`maybe_make_aware`: UTC by default,
+    or the application/local timezone when ``naive_as_utc`` is false.
+    """
+    if is_naive(dt):
+        dt = maybe_make_aware(dt, timezone.utc if naive_as_utc else None)
+    return dt.timestamp()
+
+
+def to_timer_timestamp(
+        dt: datetime, tz: tzinfo | None = None,
+        naive_as_utc: bool = True,
+        time: Callable[[], float] = _time.time,
+        monotonic: Callable[[], float] = _time.monotonic) -> float:
+    """Convert an absolute datetime to the timer's monotonic deadline."""
+    if is_naive(dt):
+        dt = maybe_make_aware(dt, tz, naive_as_utc=naive_as_utc)
+    clock_offset = time() - monotonic()
+    return max(dt.timestamp() - clock_offset, 0)
+
+
+def to_display_timezone(
+        dt: datetime, tz: tzinfo | None = None,
+        naive_as_utc: bool = True) -> datetime:
+    """Convert a message timestamp for local display without changing it."""
+    return localize(maybe_make_aware(
+        dt, tz or timezone.local, naive_as_utc=naive_as_utc,
+    ), tz or timezone.local)
+
+
+def is_expired(
+        expires: datetime, now: datetime | None = None,
+        tz: tzinfo | None = None,
+        naive_as_utc: bool = True) -> bool:
+    """Compare expiration against an absolute instant, not wall-clock fields."""
+    now = now or datetime.now(datetime_timezone.utc)
+    if is_naive(expires):
+        expires = maybe_make_aware(expires, tz, naive_as_utc=naive_as_utc)
+    return now.timestamp() > expires.timestamp()
 
 
 class ffwd:

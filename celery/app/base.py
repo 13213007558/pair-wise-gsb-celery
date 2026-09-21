@@ -1030,6 +1030,7 @@ class Celery:
         options = router.route(
             options, route_name or name, args, kwargs, task_type)
 
+        scheduled_now = self.now()
         if eta or countdown:
             driver_type = self.producer_pool.connections.connection.transport.driver_type
             if detect_quorum_queues(self, driver_type)[0]:
@@ -1043,7 +1044,12 @@ class Celery:
                     if eta:
                         if isinstance(eta, str):
                             eta = isoparse(eta)
-                        countdown = (maybe_make_aware(eta) - self.now()).total_seconds()
+                        countdown = (
+                            maybe_make_aware(
+                                eta, self.timezone,
+                                naive_as_utc=conf.enable_utc,
+                            ) - scheduled_now
+                        ).total_seconds()
 
                     if countdown:
                         if countdown > 0:
@@ -1067,10 +1073,14 @@ class Celery:
         if expires is not None:
             if isinstance(expires, datetime):
                 expires_s = (maybe_make_aware(
-                    expires) - self.now()).total_seconds()
+                    expires, self.timezone,
+                    naive_as_utc=conf.enable_utc,
+                ) - scheduled_now).total_seconds()
             elif isinstance(expires, str):
                 expires_s = (maybe_make_aware(
-                    isoparse(expires)) - self.now()).total_seconds()
+                    isoparse(expires), self.timezone,
+                    naive_as_utc=conf.enable_utc,
+                ) - scheduled_now).total_seconds()
             else:
                 expires_s = expires
 
@@ -1111,7 +1121,8 @@ class Celery:
             self.conf.task_send_sent_event,
             root_id, parent_id, shadow, chain,
             ignore_result=ignore_result,
-            replaced_task_nesting=replaced_task_nesting, **options
+            replaced_task_nesting=replaced_task_nesting,
+            now=scheduled_now, **options
         )
 
         stamped_headers = options.pop('stamped_headers', [])

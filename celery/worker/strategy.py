@@ -1,15 +1,13 @@
 """Task execution strategy (optimization)."""
 import logging
 
-from kombu.asynchronous.timer import to_timestamp
-
 from celery import signals
 from celery.app import trace as _app_trace
 from celery.exceptions import InvalidTaskError
 from celery.utils.imports import symbol_by_name
 from celery.utils.log import get_logger
 from celery.utils.saferepr import saferepr
-from celery.utils.time import timezone
+from celery.utils.time import to_timer_timestamp
 
 from .request import create_request_cls
 from .state import task_reserved, task_scheduled
@@ -60,7 +58,8 @@ def hybrid_to_proto2(message, body):
         'chain': None,
     }
 
-    return (args, kwargs, embed), headers, True, body.get('utc', True)
+    utc = body.get('utc', headers.get('utc', True))
+    return (args, kwargs, embed), headers, True, utc
 
 
 def proto1_to_proto2(message, body):
@@ -98,7 +97,7 @@ def proto1_to_proto2(message, body):
 
 def default(task, app, consumer,
             info=logger.info, error=logger.error, task_reserved=task_reserved,
-            to_system_tz=timezone.to_system, bytes=bytes,
+            bytes=bytes,
             proto1_to_proto2=proto1_to_proto2):
     """Default task execution strategy.
 
@@ -130,10 +129,12 @@ def default(task, app, consumer,
     revoked_tasks = consumer.controller.state.revoked
 
     def task_message_handler(message, body, ack, reject, callbacks,
-                             to_timestamp=to_timestamp):
+                             to_timer_timestamp=to_timer_timestamp):
         if body is None and 'args' not in message.payload:
+            headers = message.headers
             body, headers, decoded, utc = (
-                message.body, message.headers, False, app.uses_utc_timezone(),
+                message.body, headers, False,
+                headers.get('utc', app.conf.enable_utc),
             )
         else:
             if 'args' in message.payload:
@@ -156,7 +157,7 @@ def default(task, app, consumer,
                 'name': req.name,
                 'args': req.argsrepr,
                 'kwargs': req.kwargsrepr,
-                'eta': req.eta,
+                'eta': req.eta_local,
             }
             info(_app_trace.LOG_RECEIVED, context, extra={'data': context})
         if (req.expires or req.id in revoked_tasks) and req.revoked():
@@ -171,18 +172,15 @@ def default(task, app, consumer,
                 args=req.argsrepr, kwargs=req.kwargsrepr,
                 root_id=req.root_id, parent_id=req.parent_id,
                 retries=req.request_dict.get('retries', 0),
-                eta=req.eta and req.eta.isoformat(),
-                expires=req.expires and req.expires.isoformat(),
+                eta=req.eta and req.eta_local.isoformat(),
+                expires=req.expires and req.expires_local.isoformat(),
             )
 
         bucket = None
         eta = None
         if req.eta:
             try:
-                if req.utc:
-                    eta = to_timestamp(to_system_tz(req.eta))
-                else:
-                    eta = to_timestamp(req.eta, app.timezone)
+                eta = to_timer_timestamp(req.eta)
             except (OverflowError, ValueError) as exc:
                 error("Couldn't convert ETA %r to timestamp: %r. Task: %r",
                       req.eta, exc, req.info(safe=True), exc_info=True)

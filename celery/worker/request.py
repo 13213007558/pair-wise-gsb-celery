@@ -25,7 +25,8 @@ from celery.utils.functional import maybe, maybe_list, noop
 from celery.utils.log import get_logger
 from celery.utils.nodenames import gethostname
 from celery.utils.serialization import get_pickled_exception
-from celery.utils.time import maybe_iso8601, maybe_make_aware, timezone
+from celery.utils.time import (is_expired, maybe_iso8601,
+                                maybe_make_aware, to_display_timezone, timezone)
 
 from . import state
 
@@ -105,7 +106,9 @@ class Request:
                               else headers.copy())
         self._body = message.body if body is None else body
         self._app = app
-        self._utc = utc
+        self._utc = self._request_dict.get('utc', utc)
+        self._maybe_make_aware = maybe_make_aware
+        self._maybe_iso8601 = maybe_iso8601
         self._decoded = decoded
         if decoded:
             self._content_type = self._content_encoding = None
@@ -141,22 +144,22 @@ class Request:
         eta = self._request_dict.get('eta')
         if eta is not None:
             try:
-                eta = maybe_iso8601(eta)
+                eta = self._maybe_iso8601(eta)
             except (AttributeError, ValueError, TypeError) as exc:
                 raise InvalidTaskError(
                     f'invalid ETA value {eta!r}: {exc}')
-            self._eta = maybe_make_aware(eta, self.tzlocal)
+            self._eta = self._parse_message_time(eta)
         else:
             self._eta = None
 
         expires = self._request_dict.get('expires')
         if expires is not None:
             try:
-                expires = maybe_iso8601(expires)
+                expires = self._maybe_iso8601(expires)
             except (AttributeError, ValueError, TypeError) as exc:
                 raise InvalidTaskError(
                     f'invalid expires value {expires!r}: {exc}')
-            self._expires = maybe_make_aware(expires, self.tzlocal)
+            self._expires = self._parse_message_time(expires)
         else:
             self._expires = None
 
@@ -289,6 +292,20 @@ class Request:
         self._expires = value
 
     @property
+    def eta_local(self):
+        return to_display_timezone(self.eta, self.tzlocal)
+
+    @property
+    def expires_local(self):
+        return to_display_timezone(self.expires, self.tzlocal)
+
+    def _parse_message_time(self, value):
+        value = maybe_iso8601(value)
+        return self._maybe_make_aware(
+            value, self.tzlocal, naive_as_utc=self._utc,
+        )
+
+    @property
     def tzlocal(self):
         if self._tzlocal is None:
             self._tzlocal = self._app.conf.timezone
@@ -414,8 +431,7 @@ class Request:
     def maybe_expire(self):
         """If expired, mark the task as revoked."""
         if self.expires:
-            now = datetime.now(self.expires.tzinfo)
-            if now > self.expires:
+            if is_expired(self.expires, datetime.now(timezone.utc)):
                 revoked_tasks.add(self.id)
                 return True
 

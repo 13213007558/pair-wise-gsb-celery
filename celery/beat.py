@@ -9,7 +9,6 @@ import shelve
 import sys
 import time
 import traceback
-from calendar import timegm
 from collections import namedtuple
 from functools import total_ordering
 from pickle import UnpicklingError
@@ -27,7 +26,7 @@ from .schedules import crontab, maybe_schedule
 from .utils.functional import is_numeric_value
 from .utils.imports import load_extension_class_names, symbol_by_name
 from .utils.log import get_logger, iter_open_logger_fds
-from .utils.time import humanize_seconds, maybe_make_aware
+from .utils.time import humanize_seconds, maybe_make_aware, to_epoch
 
 __all__ = (
     'SchedulingError', 'ScheduleEntry', 'Scheduler',
@@ -297,14 +296,13 @@ class Scheduler:
     def is_due(self, entry):
         return entry.is_due()
 
-    def _when(self, entry, next_time_to_run, mktime=timegm):
+    def _when(self, entry, next_time_to_run):
         """Return a utc timestamp, make sure heapq in correct order."""
         adjust = self.adjust
 
         as_now = maybe_make_aware(entry.default_now())
 
-        return (mktime(as_now.utctimetuple()) +
-                as_now.microsecond / 1e6 +
+        return (to_epoch(as_now) +
                 (adjust(next_time_to_run) or 0))
 
     def populate_heap(self, event_t=event_t, heapify=heapq.heapify):
