@@ -18,6 +18,7 @@ DEFAULT_TASK_LOG_FMT = """[%(asctime)s: %(levelname)s/%(processName)s] \
 %(task_name)s[%(task_id)s]: %(message)s"""
 
 DEFAULT_SECURITY_DIGEST = 'sha256'
+DEFAULT_TASK_PROTOCOL_VERSIONS = (1, 2)
 
 
 OLD_NS = {'celery_{0}'}
@@ -291,8 +292,17 @@ NAMESPACES = Namespace(
             False, type='bool', old={'celery_eager_propagates_exceptions'},
         ),
         ignore_result=Option(False, type='bool'),
+        incompatible_message_action=Option(
+            'dead-letter', type='string',
+            old={'celery_task_incompatible_message_action'},
+        ),
+        protocol_versions=Option(
+            DEFAULT_TASK_PROTOCOL_VERSIONS, type='tuple',
+            old={'celery_task_protocol_versions'},
+        ),
         store_eager_result=Option(False, type='bool'),
         protocol=Option(2, type='int', old={'celery_task_protocol'}),
+        protocol_by_queue=Option({}, type='dict'),
         publish_retry=Option(
             True, type='bool', old={'celery_task_publish_retry'},
         ),

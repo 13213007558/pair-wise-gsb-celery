@@ -1,11 +1,13 @@
 """Task execution strategy (optimization)."""
 import logging
+from collections.abc import Mapping
 
 from kombu.asynchronous.timer import to_timestamp
 
 from celery import signals
 from celery.app import trace as _app_trace
 from celery.exceptions import InvalidTaskError
+from celery.protocol import validate_payload
 from celery.utils.imports import symbol_by_name
 from celery.utils.log import get_logger
 from celery.utils.saferepr import saferepr
@@ -131,14 +133,20 @@ def default(task, app, consumer,
 
     def task_message_handler(message, body, ack, reject, callbacks,
                              to_timestamp=to_timestamp):
-        if body is None and 'args' not in message.payload:
+        if isinstance(body, tuple):
             body, headers, decoded, utc = (
-                message.body, message.headers, False, app.uses_utc_timezone(),
+                body, message.headers, True, app.uses_utc_timezone(),
+            )
+        elif body is None and 'args' not in message.payload:
+            payload = message.payload
+            validate_payload(message.headers.get('protocol', 2), payload)
+            body, headers, decoded, utc = (
+                payload, message.headers, True, app.uses_utc_timezone(),
             )
         else:
-            if 'args' in message.payload:
-                body, headers, decoded, utc = hybrid_to_proto2(message,
-                                                               message.payload)
+            payload = body if body is not None else message.payload
+            if isinstance(payload, Mapping) and 'args' in payload:
+                body, headers, decoded, utc = hybrid_to_proto2(message, payload)
             else:
                 body, headers, decoded, utc = proto1_to_proto2(message, body)
 

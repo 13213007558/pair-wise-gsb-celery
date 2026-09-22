@@ -79,7 +79,7 @@ task_revoked = Signal(
 )
 task_rejected = Signal(
     name='task_rejected',
-    providing_args={'message', 'exc'},
+    providing_args={'message', 'exc', 'reason', 'protocol', 'requeue'},
 )
 task_unknown = Signal(
     name='task_unknown',

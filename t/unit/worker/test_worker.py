@@ -31,6 +31,7 @@ from celery.utils.timer2 import Timer
 from celery.worker import autoscale, components, consumer, state
 from celery.worker import worker as worker_module
 from celery.worker.consumer import Consumer
+from celery.worker.consumer.consumer import logger as consumer_logger
 from celery.worker.pidbox import gPidbox
 from celery.worker.request import Request
 from t.unit.conftest import restore_execv_state
@@ -199,8 +200,8 @@ class test_Consumer(ConsumerCase):
         assert c.event_dispatcher is not prev
         assert req.eventer is c.event_dispatcher
 
-    @patch('celery.worker.consumer.consumer.warn')
-    def test_receive_message_unknown(self, warn):
+    @patch('celery.worker.consumer.consumer.crit')
+    def test_receive_message_unknown(self, crit):
         c = self.LoopConsumer()
         c.blueprint.state = RUN
         c.steps.pop()
@@ -209,7 +210,8 @@ class test_Consumer(ConsumerCase):
 
         callback = self._get_on_message(c)
         callback(m)
-        warn.assert_called()
+        crit.assert_called()
+        channel.basic_reject.assert_called_once_with(m.delivery_tag, requeue=False)
 
     @patch('celery.worker.strategy.to_timestamp')
     def test_receive_message_eta_OverflowError(self, to_timestamp):
@@ -227,8 +229,8 @@ class test_Consumer(ConsumerCase):
         callback(m)
         assert m.acknowledged
 
-    @patch('celery.worker.consumer.consumer.error')
-    def test_receive_message_InvalidTaskError(self, error):
+    @patch('celery.worker.consumer.consumer.crit')
+    def test_receive_message_InvalidTaskError(self, crit):
         c = self.LoopConsumer()
         c.blueprint.state = RUN
         c.steps.pop()
@@ -241,8 +243,11 @@ class test_Consumer(ConsumerCase):
 
         callback = self._get_on_message(c)
         callback(m)
-        error.assert_called()
-        assert 'Received invalid task message' in error.call_args[0][0]
+        crit.assert_called()
+        m.reject_log_error.assert_called_with(
+            consumer_logger,
+            c.connection_errors, requeue=False,
+        )
 
     @patch('celery.worker.consumer.consumer.crit')
     def test_on_decode_error(self, crit):
@@ -255,7 +260,11 @@ class test_Consumer(ConsumerCase):
 
         message = MockMessage()
         c.on_decode_error(message, KeyError('foo'))
-        assert message.ack.call_count
+        assert not message.ack.call_count
+        message.reject_log_error.assert_called_with(
+            consumer_logger,
+            c.connection_errors, requeue=False,
+        )
         assert "Can't decode message body" in crit.call_args[0][0]
 
     def _get_on_message(self, c):
@@ -485,9 +494,9 @@ class test_Consumer(ConsumerCase):
             self.buffer.get_nowait()
         assert self.timer.empty()
 
-    @patch('celery.worker.consumer.consumer.warn')
+    @patch('celery.worker.consumer.consumer.crit')
     @patch('celery.worker.consumer.consumer.logger')
-    def test_receieve_message_ack_raises(self, logger, warn):
+    def test_receieve_message_ack_raises(self, logger, crit):
         c = self.LoopConsumer()
         c.blueprint.state = RUN
         channel = Mock(name='channel')
@@ -501,13 +510,17 @@ class test_Consumer(ConsumerCase):
         c.connection_errors = (socket.error,)
         m.reject = Mock()
         m.reject.side_effect = socket.error('foo')
+        m.reject_log_error = Mock(
+            side_effect=lambda *a, **k: logger.critical('reject failed'),
+        )
         callback = self._get_on_message(c)
         assert not callback(m)
-        warn.assert_called()
+        crit.assert_called()
         with pytest.raises(Empty):
             self.buffer.get_nowait()
         assert self.timer.empty()
-        m.reject_log_error.assert_called_with(logger, c.connection_errors)
+        m.reject_log_error.assert_called_with(
+            logger, c.connection_errors, requeue=False)
 
     def test_receive_message_eta(self):
         if os.environ.get('C_DEBUG_TEST'):

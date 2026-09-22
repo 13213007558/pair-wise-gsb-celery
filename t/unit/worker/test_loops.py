@@ -1,7 +1,7 @@
 import errno
 import socket
 from queue import Empty
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 
 import pytest
 from kombu.asynchronous import ERR, READ, WRITE, Hub
@@ -187,6 +187,7 @@ class test_asynloop:
     def task_context(self, sig, **kwargs):
         x, on_task = get_task_callback(self.app, **kwargs)
         message = self.task_message_from_sig(self.app, sig)
+        message.decode.return_value = message.payload
         strategy = x.obj.strategies[sig.task] = Mock(name='strategy')
         return x, on_task, message, strategy
 
@@ -194,7 +195,7 @@ class test_asynloop:
         x, on_task, msg, strategy = self.task_context(self.add.s(2, 2))
         on_task(msg)
         strategy.assert_called_with(
-            msg, None,
+            msg, msg.payload,
             PromiseEqual(x._consumer.call_soon_ack, msg.ack_log_error),
             PromiseEqual(x._consumer.call_soon_ack, msg.reject_log_error), [],
         )
@@ -206,7 +207,7 @@ class test_asynloop:
         )
         on_task(msg)
         strategy.assert_called_with(
-            msg, None,
+            msg, msg.payload,
             PromiseEqual(x._consumer.call_soon_ack, msg.ack_log_error),
             PromiseEqual(x._consumer.call_soon_ack, msg.reject_log_error),
             cbs,
@@ -216,7 +217,13 @@ class test_asynloop:
         x, on_task, msg, strategy = self.task_context(self.add.s(2, 2))
         msg.headers.pop('task')
         on_task(msg)
-        x.on_unknown_message.assert_called_with(msg.decode(), msg)
+        x.on_invalid_task.assert_called_with(ANY, msg, ANY)
+
+    def test_on_task_message_invalid_headers(self):
+        x, on_task, msg, strategy = self.task_context(self.add.s(2, 2))
+        msg.headers = []
+        on_task(msg)
+        x.on_invalid_task.assert_called_with(None, msg, ANY)
 
     def test_on_task_pool_raises(self):
         x, on_task, msg, strategy = self.task_context(self.add.s(2, 2))
@@ -228,7 +235,7 @@ class test_asynloop:
         x, on_task, msg, strategy = self.task_context(self.add.s(2, 2))
         exc = strategy.side_effect = InvalidTaskError()
         on_task(msg)
-        x.on_invalid_task.assert_called_with(None, msg, exc)
+        x.on_invalid_task.assert_called_with(msg.payload, msg, exc)
 
     def test_on_task_DecodeError(self):
         x, on_task, msg, strategy = self.task_context(self.add.s(2, 2))

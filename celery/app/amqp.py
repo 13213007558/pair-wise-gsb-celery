@@ -11,6 +11,8 @@ from kombu.utils.functional import maybe_list
 from kombu.utils.objects import cached_property
 
 from celery import signals
+from celery.exceptions import ImproperlyConfigured
+from celery.protocol import PROTOCOL_HEADER
 from celery.utils.nodenames import anon_nodename
 from celery.utils.saferepr import saferepr
 from celery.utils.text import indent as textindent
@@ -260,12 +262,25 @@ class AMQP:
         self.task_protocols = {
             1: self.as_task_v1,
             2: self.as_task_v2,
+            3: self.as_task_v3,
         }
         self.app._conf.bind_to(self._handle_conf_update)
 
-    @cached_property
-    def create_task_message(self):
-        return self.task_protocols[self.app.conf.task_protocol]
+    def _select_task_protocol(self, options):
+        protocol = options.pop('task_protocol', None)
+        if protocol is None:
+            protocol = self.app.conf.task_protocol
+        try:
+            protocol = int(protocol)
+            encoder = self.task_protocols[protocol]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ImproperlyConfigured(
+                f'Unsupported task protocol version: {protocol!r}') from exc
+        return protocol, encoder
+
+    def create_task_message(self, *args, **kwargs):
+        _, encoder = self._select_task_protocol(kwargs)
+        return encoder(*args, **kwargs)
 
     @cached_property
     def send_task_message(self):
@@ -418,6 +433,11 @@ class AMQP:
             } if create_sent_event else None,
         )
 
+    def as_task_v3(self, *args, **kwargs):
+        message = self.as_task_v2(*args, **kwargs)
+        headers = {PROTOCOL_HEADER: 3, **message.headers}
+        return message._replace(headers=headers)
+
     def as_task_v1(self, task_id, name, args=None, kwargs=None,
                    countdown=None, eta=None, group_id=None, group_index=None,
                    expires=None, retries=0,
@@ -515,6 +535,12 @@ class AMQP:
             retry = default_retry if retry is None else retry
             headers2, properties, body, sent_event = message
             if headers:
+                for key in (
+                    PROTOCOL_HEADER, 'id', 'task', 'root_id', 'parent_id',
+                    'stamped_headers', 'stamps', 'argsrepr', 'kwargsrepr',
+                    'eta', 'expires', 'retries',
+                ):
+                    headers.pop(key, None)
                 headers2.update(headers)
             if kwargs:
                 properties.update(kwargs)

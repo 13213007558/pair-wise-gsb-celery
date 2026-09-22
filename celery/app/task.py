@@ -31,7 +31,8 @@ _UNSET = object()
 #: extracts attributes related to publishing a message from an object.
 extract_exec_options = mattrgetter(
     'queue', 'routing_key', 'exchange', 'priority', 'expires',
-    'serializer', 'delivery_mode', 'compression', 'time_limit',
+    'serializer', 'delivery_mode', 'compression',
+    'time_limit',
     'soft_time_limit', 'immediate', 'mandatory',  # imm+man is deprecated
 )
 
@@ -274,6 +275,9 @@ class Task:
     #: The name of a serializer that are registered with
     #: :mod:`kombu.serialization.registry`.  Default is `'json'`.
     serializer = None
+
+    #: Default task message protocol. ``None`` uses ``task_protocol``.
+    task_protocol = None
 
     #: Hard time limit.
     #: Defaults to the :setting:`task_time_limit` setting.

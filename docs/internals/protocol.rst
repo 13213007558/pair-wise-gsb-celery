@@ -13,6 +13,99 @@
 Task messages
 =============
 
+Compatibility policy
+--------------------
+
+Protocol negotiation is a publication policy, not an in-band broker
+handshake. Producers must choose a version known to be supported by the
+destination queue's workers. During a mixed deployment, keep protocol 2
+queues for old workers and publish protocol 3 to upgraded queues.
+
+A publication can select its version with the ``task_protocol`` execution
+option, a :setting:`task_routes` result, the
+:setting:`task_protocol_by_queue` mapping, or the task class attribute, in
+that order. The explicit execution option has the highest priority. The queue
+policy protects a legacy queue from a task whose class default is protocol 3.
+The producer does
+not downgrade a v3 message to v2 because that can silently change its
+envelope; the caller must select a compatible queue or version.
+
+Protocol 1 is detected from protocol fields in the body (including legacy
+hybrid messages that carry unrelated custom headers). Protocol 2 is detected
+when both ``task`` and ``id`` headers exist without an explicit ``protocol``
+header. Protocol 3 always contains ``protocol: 3``.
+
+Consumers validate a message before creating a task request or executing
+any decoded argument:
+
+- ``protocol-unsupported``: the version is absent from
+  :setting:`task_protocol_versions`.
+- ``required-field-missing``: a required identity, retry, ETA, argument
+  representation, stamp, correlation, or body field is missing or null.
+- ``extra-field``: v3 contains an undeclared non-broker header or embed
+  field. Custom v3 headers must be listed in ``stamped_headers``.
+- ``serializer-disallowed``: the MIME type is not allowed by
+  :setting:`accept_content`.
+- ``serializer-unknown``: the MIME type has no registered decoder.
+- ``serializer-error``: the serializer registry or worker configuration is
+  invalid.
+- ``content-encoding-missing``: the content encoding is absent.
+- ``decode-error``: signature verification or body deserialization fails.
+- ``body-shape``, ``args-type``, ``kwargs-type`` and ``embed-type``:
+  the decoded body cannot be used safely.
+
+No incompatible message is acknowledged. The action is either rejection
+to dead-letter (``requeue=False``) or requeue, controlled by
+:setting:`task_incompatible_message_action`. Rejections emit the
+``task_rejected`` signal and a ``task-rejected`` event containing
+``reason``, ``protocol`` and ``requeue``. Broker publish retries and worker
+reconnect retries remain separate operational branches and never validate or
+execute a task message.
+
+Protocol 3 preserves ``id``, ``root_id``, ``parent_id``,
+``stamped_headers`` and ``stamps``. It also preserves ``retries``,
+``eta``, ``expires``, timelimits, group, chain/chord callbacks,
+``argsrepr`` and ``kwargsrepr``. The signed serializer still verifies the
+encoded body and embedded content type before deserialization; a message
+is rejected if its outer serializer/content type is disallowed or the
+signature/body cannot be decoded.
+
+Synchronous and asynchronous producers must both select the protocol before
+serialization. ``Task.apply_async``, ``Signature.apply_async`` and
+``app.send_task`` accept the same ``task_protocol`` option; eager calls in
+the current process do not send the envelope and therefore cannot negotiate
+with remote workers. Custom code using Kombu directly must build the v2/v3
+headers itself and not supply a forged ``protocol`` header through the
+generic ``headers`` option.
+
+Version 3
+---------
+
+Definition
+~~~~~~~~~~
+
+Protocol 3 is an explicit-header version of protocol 2. The body shape and
+all v2 routing/metadata fields are retained, with these additions or
+stricter requirements:
+
+.. code-block:: python
+
+    headers = {
+        'protocol': 3,
+        'id': uuid,
+        'task': string,
+        'root_id': uuid,
+        'argsrepr': str,
+        'kwargsrepr': str,
+        'stamped_headers': list[str],
+        'stamps': dict[str, Any],
+        # The remaining v2 headers retain their v2 meanings.
+    }
+
+Every custom application header must appear in ``stamped_headers`` and have
+a matching value in ``stamps``. Broker-managed dead-letter headers (such as
+``x-death``) are allowed.
+
 .. _message-protocol-task-v2:
 
 Version 2

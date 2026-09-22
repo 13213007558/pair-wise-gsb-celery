@@ -422,6 +422,20 @@ Provides arguments:
 
     The error that occurred.
 
+* ``reason``
+
+    Stable rejection reason, such as ``decode-error``,
+    ``protocol-unsupported`` or ``required-field-missing``.
+
+* ``protocol``
+
+    Rejected task protocol version, when known.
+
+* ``requeue``
+
+    :const:`True` when the broker was asked to requeue the message,
+    :const:`False` for rejection/dead-letter.
+
 .. signal:: task_rejected
 
 ``task_rejected``

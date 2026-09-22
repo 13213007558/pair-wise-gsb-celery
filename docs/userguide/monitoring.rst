@@ -752,10 +752,12 @@ Sent if the execution of the task failed.
 task-rejected
 ~~~~~~~~~~~~~
 
-:signature: ``task-rejected(uuid, requeue)``
+:signature: ``task-rejected(uuid, requeue, reason, protocol)``
 
 The task was rejected by the worker, possibly to be re-queued or moved to a
 dead letter queue.
+``reason`` identifies the decode, serializer, required-field, extra-field or
+version policy branch that rejected the message.
 
 .. event:: task-revoked
 

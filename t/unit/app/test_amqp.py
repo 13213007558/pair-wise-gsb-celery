@@ -503,6 +503,44 @@ class test_AMQP(test_AMQP_Base):
         r2 = self.app.amqp.routes
         assert r1 is r2
 
+    def test_send_task_selects_protocol_for_queue(self):
+        queue_name = self.app.conf.task_default_queue
+        self.app.conf.task_protocol_by_queue = {queue_name: 3}
+        with patch.object(self.app.amqp, 'send_task_message') as send_message:
+            self.app.send_task('foo')
+
+        assert send_message.call_args.args[2].headers['protocol'] == 3
+
+    def test_send_task_selects_protocol_from_route(self):
+        queue_name = self.app.conf.task_default_queue
+        self.app.conf.task_routes = {
+            'foo': {'queue': queue_name, 'task_protocol': 3},
+        }
+        with patch.object(self.app.amqp, 'send_task_message') as send_message:
+            self.app.send_task('foo')
+
+        assert send_message.call_args.args[2].headers['protocol'] == 3
+
+    def test_task_class_can_select_default_protocol(self):
+        @self.app.task(task_protocol=3, shared=False)
+        def protocol_task():
+            pass
+
+        assert protocol_task.task_protocol == 3
+
+    def test_queue_policy_overrides_task_default_protocol(self):
+        queue_name = self.app.conf.task_default_queue
+        self.app.conf.task_protocol_by_queue = {queue_name: 2}
+
+        @self.app.task(task_protocol=3, shared=False)
+        def protocol_task():
+            pass
+
+        with patch.object(self.app.amqp, 'send_task_message') as send_message:
+            protocol_task.apply_async()
+
+        assert send_message.call_args.args[2].headers.get('protocol') is None
+
     def update_conf_runtime_for_tasks_queues(self):
         self.app.conf.update(task_routes={'task.create_pr': 'queue.qwerty'})
         self.app.send_task('task.create_pr')
@@ -596,3 +634,42 @@ class test_as_task_v2(test_AMQP_Base):
         assert embed['callbacks'] == [utf8dict(t.s(1)), utf8dict(t.s(2))]
         assert embed['errbacks'] == [utf8dict(t.s(3)), utf8dict(t.s(4))]
         assert embed['chord'] == utf8dict(t.s(5))
+
+    def test_protocol_3_preserves_identity_retry_eta_and_stamps(self):
+        message = self.app.amqp.as_task_v3(
+            'task-id', 'foo', (1,), {'answer': 42}, countdown=60,
+            retries=2, root_id='root-id', parent_id='parent-id',
+            stamped_headers=['custom'], custom='stamped-value',
+        )
+
+        assert message.headers['protocol'] == 3
+        assert message.headers['id'] == 'task-id'
+        assert message.headers['root_id'] == 'root-id'
+        assert message.headers['parent_id'] == 'parent-id'
+        assert message.headers['retries'] == 2
+        assert message.headers['eta'] is not None
+        assert message.headers['argsrepr'] == '(1,)'
+        assert message.headers['kwargsrepr'] == "{'answer': 42}"
+        assert message.headers['stamped_headers'] == ['custom']
+        assert message.headers['stamps'] == {'custom': 'stamped-value'}
+
+    def test_create_message_selects_protocol_per_call(self):
+        message = self.app.amqp.create_task_message(
+            uuid(), 'foo', task_protocol=3,
+        )
+
+        assert message.headers['protocol'] == 3
+
+    def test_publish_headers_cannot_override_protocol_identity(self):
+        producer = Mock(name='producer')
+        message = self.app.amqp.as_task_v3('task-id', 'foo')
+
+        self.app.amqp.send_task_message(
+            producer, 'foo', message,
+            headers={'protocol': 2, 'id': 'forged-id', 'custom': 'ok'},
+        )
+
+        headers = producer.publish.call_args.kwargs['headers']
+        assert headers['protocol'] == 3
+        assert headers['id'] == 'task-id'
+        assert headers['custom'] == 'ok'

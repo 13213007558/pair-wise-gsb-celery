@@ -17,6 +17,7 @@ from celery.exceptions import WorkerShutdown, WorkerTerminate
 from celery.utils.collections import LimitedSet
 from celery.utils.quorum_queues import detect_quorum_queues
 from celery.utils.time import utcoffset
+from celery.worker.consumer import consumer as consumer_module
 from celery.worker.consumer.agent import Agent
 from celery.worker.consumer.consumer import (CANCEL_TASKS_BY_DEFAULT, CLOSE, COLLECT_SOCKET_TIMEOUT, TERMINATE,
                                              Consumer)
@@ -26,6 +27,8 @@ from celery.worker.consumer.heart import Heart
 from celery.worker.consumer.mingle import Mingle
 from celery.worker.consumer.tasks import Tasks
 from celery.worker.state import active_requests, successful_requests
+
+logger = consumer_module.logger
 
 
 class FakeOnCloseRequest:
@@ -324,6 +327,133 @@ class test_Consumer(ConsumerTestCase):
 
         with subtests.test("maximum prefetch is reached"):
             assert c._maximum_prefetch_restored is True
+
+    def protocol_message(
+        self, *, protocol=2, headers=None, content_type='application/json',
+    ):
+        task_id = 'protocol-task-id'
+        message = Mock(name='protocol-message')
+        message.headers = {
+            'protocol': protocol,
+            'id': task_id,
+            'task': self.add.name,
+            'root_id': task_id,
+            'argsrepr': '()',
+            'kwargsrepr': '{}',
+            'stamped_headers': [],
+            'stamps': {},
+            **(headers or {}),
+        }
+        message.content_type = content_type
+        message.content_encoding = 'utf-8'
+        message.body = b'[]'
+        message.properties = {'correlation_id': task_id}
+        message.payload = ((), {}, {})
+        message.decode.return_value = message.payload
+        return message
+
+    def test_protocol_3_rejected_before_strategy_by_default(self):
+        c = self.get_consumer()
+        c.strategies[self.add.name] = Mock()
+        strategy = c.strategies[self.add.name]
+        message = self.protocol_message(protocol=3)
+
+        c.create_task_handler()(message)
+
+        strategy.assert_not_called()
+        message.reject_log_error.assert_called_once_with(
+            logger, c.connection_errors, requeue=False)
+
+    def test_serializer_registry_error_rejected_before_decode(self):
+        c = self.get_consumer()
+        c.app.conf.accept_content = ('not-installed',)
+        c.strategies[self.add.name] = Mock()
+        message = self.protocol_message()
+        message.decode.side_effect = AssertionError('decode attempted')
+
+        c.create_task_handler()(message)
+
+        message.decode.assert_not_called()
+        message.reject_log_error.assert_called_once_with(
+            logger, c.connection_errors, requeue=False)
+
+    def test_protocol_policy_reports_reason_and_event(self):
+        c = self.get_consumer()
+        c.app.conf.task_protocol_versions = (1, 2, 3)
+        c.event_dispatcher = Mock()
+        c.strategies[self.add.name] = Mock()
+        strategy = c.strategies[self.add.name]
+        message = self.protocol_message(protocol=3, headers={'unknown': 'value'})
+
+        c.create_task_handler()(message)
+
+        strategy.assert_not_called()
+        message.reject_log_error.assert_called_once_with(
+            logger, c.connection_errors, requeue=False)
+        c.event_dispatcher.send.assert_called_once_with(
+            'task-rejected', uuid='protocol-task-id', name=self.add.name,
+            requeue=False, reason='extra-field', protocol=3,
+        )
+
+    def test_protocol_policy_can_requeue_instead_of_dead_letter(self):
+        c = self.get_consumer()
+        c.app.conf.task_incompatible_message_action = 'requeue'
+        c.strategies[self.add.name] = Mock()
+        strategy = c.strategies[self.add.name]
+        message = self.protocol_message(protocol=3)
+
+        c.create_task_handler()(message)
+
+        message.reject_log_error.assert_called_once_with(
+            logger, c.connection_errors, requeue=True)
+
+    def test_disallowed_serializer_rejected_before_decode(self):
+        c = self.get_consumer()
+        c.app.conf.task_protocol_versions = (1, 2, 3)
+        c.app.conf.accept_content = ('json',)
+        c.strategies[self.add.name] = Mock()
+        strategy = c.strategies[self.add.name]
+        message = self.protocol_message(content_type='application/x-msgpack')
+        message.decode.side_effect = AssertionError('decode attempted')
+
+        c.create_task_handler()(message)
+
+        strategy.assert_not_called()
+        message.decode.assert_not_called()
+        message.reject_log_error.assert_called_once_with(
+            logger, c.connection_errors, requeue=False)
+
+    def test_decode_error_rejects_instead_of_acknowledging(self):
+        c = self.get_consumer()
+        c.strategies[self.add.name] = Mock()
+        strategy = c.strategies[self.add.name]
+        message = Mock(name='undecodable-message')
+        message.headers = {}
+        message.properties = {}
+        message.body = b'bad'
+        message.decode.side_effect = ValueError('bad body')
+
+        c.create_task_handler()(message)
+
+        strategy.assert_not_called()
+        message.ack.assert_not_called()
+        message.reject_log_error.assert_called_once_with(
+            logger, c.connection_errors, requeue=False)
+
+    def test_invalid_header_mapping_rejected_before_strategy(self):
+        c = self.get_consumer()
+        c.strategies[self.add.name] = Mock()
+        strategy = c.strategies[self.add.name]
+        message = self.protocol_message()
+        message.headers = []
+        message.decode.side_effect = AssertionError('decode attempted')
+
+        c.create_task_handler()(message)
+
+        strategy.assert_not_called()
+        message.decode.assert_not_called()
+        message.reject_log_error.assert_called_once_with(
+            logger, c.connection_errors, requeue=False)
 
     def test_flush_events(self):
         c = self.get_consumer()

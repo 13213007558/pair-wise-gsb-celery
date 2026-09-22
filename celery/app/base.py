@@ -1027,8 +1027,22 @@ class Celery:
             options.pop('expires', None)
 
         ignore_result = options.pop('ignore_result', False)
+        explicit_protocol = options.pop('task_protocol', None)
         options = router.route(
             options, route_name or name, args, kwargs, task_type)
+        route_protocol = options.pop('task_protocol', None)
+        queue = options.get('queue')
+        queue_name = queue.name if hasattr(queue, 'name') else queue
+        queue_protocol = conf.task_protocol_by_queue.get(queue_name)
+        task_protocol = getattr(task_type, 'task_protocol', None)
+        selected_protocol = (
+            explicit_protocol or
+            route_protocol or
+            queue_protocol or
+            task_protocol
+        )
+        if selected_protocol is not None:
+            options['task_protocol'] = selected_protocol
 
         if eta or countdown:
             driver_type = self.producer_pool.connections.connection.transport.driver_type

@@ -34,6 +34,30 @@ The API defines a standard set of execution options, as well as three methods:
         means that the task will not be executed by a worker, but in the current
         process instead (a message won't be sent).
 
+Protocol selection
+==================
+
+Both asynchronous and synchronous-looking task calls use the same publication
+policy. ``delay()`` accepts no options, so protocol 2/3 selection must be
+configured on the task class, route, or :setting:`task_protocol_by_queue`.
+``apply_async()`` and :meth:`~@Celery.send_task` can select it per call with
+``task_protocol``::
+
+    add.apply_async((2, 2), task_protocol=3)
+    app.send_task('tasks.add', args=(2, 2), task_protocol=3)
+
+The protocol is selected before serialization. Do not put ``protocol`` in the
+generic ``headers`` mapping; that internal envelope header is reserved and is
+removed to prevent a v2 message masquerading as another protocol. Eager task
+execution does not publish a broker message and does not negotiate with remote
+workers; use an asynchronous call when a remote queue protocol matters.
+
+Protocol 3 is not downgraded automatically. Publish it only to queues whose
+workers include 3 in :setting:`task_protocol_versions`, or publish protocol 2
+explicitly for legacy queues. The serializer must remain accepted by those
+workers; signed serializer errors and disallowed content types reject the
+message before task arguments are constructed.
+
 .. _calling-cheat:
 
 .. topic:: Quick Cheat Sheet

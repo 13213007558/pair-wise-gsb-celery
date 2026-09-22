@@ -15,7 +15,7 @@ from billiard.common import restart_state
 from billiard.exceptions import RestartFreqExceeded
 from kombu.asynchronous.semaphore import DummyLock
 from kombu.common import ignore_errors
-from kombu.exceptions import ContentDisallowed, DecodeError
+from kombu.exceptions import ContentDisallowed, DecodeError, SerializerNotInstalled
 from kombu.utils.compat import _detect_environment
 from kombu.utils.encoding import safe_repr
 from kombu.utils.limits import TokenBucket
@@ -23,8 +23,16 @@ from vine import ppartial, promise
 
 from celery import bootsteps, signals
 from celery.app.trace import build_tracer
-from celery.exceptions import (CPendingDeprecationWarning, InvalidTaskError, NotRegistered, WorkerShutdown,
-                               WorkerTerminate)
+from celery.exceptions import (
+    CPendingDeprecationWarning,
+    ImproperlyConfigured,
+    IncompatibleTaskProtocol,
+    InvalidTaskError,
+    NotRegistered,
+    WorkerShutdown,
+    WorkerTerminate,
+)
+from celery.protocol import validate_before_decode, validate_payload
 from celery.utils.functional import noop
 from celery.utils.log import get_logger
 from celery.utils.nodenames import gethostname
@@ -96,23 +104,16 @@ The delivery info for this task is:
 %s
 """
 
-#: Error message for when an invalid task message is received.
-INVALID_TASK_ERROR = """\
-Received invalid task message: %s
-The message has been ignored and discarded.
-
-Please ensure your message conforms to the task
-message protocol as described here:
-https://docs.celeryq.dev/en/latest/internals/protocol.html
-
-The full contents of the message body was:
-%s
-"""
-
 MESSAGE_DECODE_ERROR = """\
 Can't decode message body: %r [type:%r encoding:%r headers:%s]
 
 body: %s
+"""
+
+MESSAGE_PROTOCOL_ERROR = """\
+Rejected task message due to protocol policy violation: %s
+protocol=%r content_type=%r content_encoding=%r details=%s
+%s
 """
 
 MESSAGE_REPORT = """\
@@ -139,8 +140,12 @@ def dump_body(m, body):
     """Format message body for debugging purposes."""
     # v2 protocol does not deserialize body
     body = m.body if body is None else body
+    try:
+        body_length = len(m.body)
+    except TypeError:
+        body_length = None
     return '{} ({}b)'.format(truncate(safe_repr(body), 1024),
-                             len(m.body))
+                             body_length)
 
 
 class Consumer:
@@ -512,21 +517,75 @@ class Consumer:
                 self.blueprint, self.hub, self.qos, self.amqheartbeat,
                 self.app.clock, self.amqheartbeat_rate)
 
+    def _protocol_action(self):
+        action = self.app.conf.task_incompatible_message_action
+        if action not in {'requeue', 'dead-letter', 'reject'}:
+            raise ImproperlyConfigured(
+                'task_incompatible_message_action must be one of '
+                "'requeue', 'dead-letter' or 'reject', not "
+                f'{action!r}.')
+        return action == 'requeue'
+
+    def _task_identity(self, message, body=None):
+        headers = getattr(message, 'headers', None)
+        headers = headers if hasattr(headers, 'get') else {}
+        task_id = headers.get('id')
+        if task_id is None and isinstance(body, dict):
+            task_id = body.get('id')
+        return task_id or '', headers.get('task') or ''
+
+    def reject_task_message(self, message, exc, reason, body=None):
+        requeue = self._protocol_action()
+        protocol = getattr(exc, 'protocol', None)
+        details = getattr(exc, 'details', {})
+        if reason == 'decode-error':
+            crit(MESSAGE_DECODE_ERROR,
+                 exc, message.content_type, message.content_encoding,
+                 safe_repr(message.headers), dump_body(message, message.body),
+                 exc_info=1)
+        else:
+            crit(
+                MESSAGE_PROTOCOL_ERROR,
+                reason, protocol, message.content_type,
+                message.content_encoding, safe_repr(details),
+                self._message_report(body, message),
+                exc_info=1,
+            )
+        message.reject_log_error(
+            logger, self.connection_errors, requeue=requeue,
+        )
+        task_id, task_name = self._task_identity(message, body)
+        if self.event_dispatcher:
+            self.event_dispatcher.send(
+                'task-rejected',
+                uuid=task_id, name=task_name, requeue=requeue,
+                reason=reason, protocol=protocol,
+            )
+        signals.task_rejected.send(
+            sender=self, message=message, exc=exc, reason=reason,
+            protocol=protocol, requeue=requeue,
+        )
+
     def on_decode_error(self, message, exc):
-        """Callback called if an error occurs while decoding a message.
+        """Reject a message whose body cannot safely be decoded."""
+        return self.reject_task_message(message, exc, 'decode-error')
 
-        Simply logs the error and acknowledges the message so it
-        doesn't enter a loop.
-
-        Arguments:
-            message (kombu.Message): The message received.
-            exc (Exception): The exception being handled.
-        """
-        crit(MESSAGE_DECODE_ERROR,
-             exc, message.content_type, message.content_encoding,
-             safe_repr(message.headers), dump_body(message, message.body),
-             exc_info=1)
-        message.ack()
+    def validate_task_envelope(self, message):
+        try:
+            return validate_before_decode(
+                message,
+                self.app.conf.task_protocol_versions,
+                self.app.conf.accept_content,
+            )
+        except SerializerNotInstalled as exc:
+            if isinstance(exc, ContentDisallowed):
+                raise
+            get_header = getattr(message.headers, 'get', lambda *_: None)
+            protocol = get_header('protocol')
+            raise IncompatibleTaskProtocol(
+                'serializer-error', protocol=protocol,
+                error=str(exc),
+            ) from exc
 
     def on_close(self):
         # Clear internal queues to get rid of old messages.
@@ -732,10 +791,8 @@ class Consumer:
         )
 
     def on_invalid_task(self, body, message, exc):
-        error(INVALID_TASK_ERROR, exc, dump_body(message, body),
-              exc_info=True)
-        message.reject_log_error(logger, self.connection_errors)
-        signals.task_rejected.send(sender=self, message=message, exc=exc)
+        reason = getattr(exc, 'reason', 'invalid-task')
+        return self.reject_task_message(message, exc, reason, body)
 
     def update_strategies(self):
         loader = self.app.loader
@@ -753,9 +810,11 @@ class Consumer:
         call_soon_ack = self.call_soon_ack
 
         def on_task_received(message):
-            # payload will only be set for v1 protocol, since v2
-            # will defer deserializing the message body to the pool.
             payload = None
+            try:
+                protocol = self.validate_task_envelope(message)
+            except IncompatibleTaskProtocol as exc:
+                return on_invalid_task(None, message, exc)
             try:
                 type_ = message.headers['task']  # protocol v2
             except TypeError:
@@ -766,13 +825,26 @@ class Consumer:
                 except Exception as exc:  # pylint: disable=broad-except
                     return self.on_decode_error(message, exc)
                 try:
+                    validate_payload(protocol, payload)
+                except IncompatibleTaskProtocol as exc:
+                    return on_invalid_task(payload, message, exc)
+                try:
                     type_, payload = payload['task'], payload  # protocol v1
                 except (TypeError, KeyError):
                     return on_unknown_message(payload, message)
+            else:
+                try:
+                    payload = message.decode()
+                except Exception as exc:  # pylint: disable=broad-except
+                    return self.on_decode_error(message, exc)
+                try:
+                    validate_payload(protocol, payload)
+                except IncompatibleTaskProtocol as exc:
+                    return on_invalid_task(payload, message, exc)
             try:
                 strategy = strategies[type_]
             except KeyError as exc:
-                return on_unknown_task(None, message, exc)
+                return on_unknown_task(payload, message, exc)
             else:
                 try:
                     ack_log_error_promise = promise(

@@ -400,9 +400,74 @@ The default is to send uncompressed messages.
 Default: 2 (since 4.0).
 
 Set the default task message protocol version used to send tasks.
-Supports protocols: 1 and 2.
+Supports protocols: 1, 2 and 3. The default remains 2 during migration.
 
-Protocol 2 is supported by 3.1.24 and 4.x+.
+Protocol 3 uses the same body shape as protocol 2, but always includes an
+explicit ``protocol: 3`` header and requires all v3 envelope fields to be
+present. Only publish it to queues whose workers include 3 in
+:setting:`task_protocol_versions`.
+
+The version for one publication is selected in this order:
+
+    1. ``task_protocol`` passed to :meth:`@-Task.apply_async` or
+       :meth:`~@Celery.send_task`.
+    2. ``task_protocol`` returned by a :setting:`task_routes` entry.
+    3. The queue mapping in :setting:`task_protocol_by_queue`; this protects
+       legacy queues even when a task defaults to protocol 3.
+    4. The task class ``task_protocol`` attribute, when it is not :const:`None`.
+    5. This setting.
+
+Protocol 2 is supported by 3.1.24 and 4.x+. Protocol 3 requires a worker
+from this migration-capable release.
+
+.. setting:: task_protocol_by_queue
+
+``task_protocol_by_queue``
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``{}``.
+
+Maps a queue name to the task message protocol used when a route selects
+that queue. This is useful when legacy and upgraded workers consume separate
+queues during migration::
+
+    task_protocol_by_queue = {
+        'celery': 2,
+        'celery-v3': 3,
+    }
+
+An explicit call or route option still takes precedence.
+
+.. setting:: task_protocol_versions
+
+``task_protocol_versions``
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``(1, 2)``.
+
+Task message protocol versions accepted by this worker. Enable 3 only after
+the worker and its monitoring/dead-letter path are ready::
+
+    task_protocol_versions = (1, 2, 3)
+
+Messages outside this range are rejected before the body is decoded.
+
+.. setting:: task_incompatible_message_action
+
+``task_incompatible_message_action``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``"dead-letter"``.
+
+Controls messages rejected by the protocol or serializer policy:
+
+- ``"dead-letter"``: reject without requeue. Configure a broker dead-letter
+  exchange/queue when this must be retained.
+- ``"requeue"``: reject with requeue. Use this only for transient rollouts;
+  poison messages will redeliver repeatedly.
+- ``"reject"``: reject without requeue and no configured dead-letter target.
+
+Decode errors follow the same setting and are never acknowledged.
 
 .. setting:: task_serializer
 

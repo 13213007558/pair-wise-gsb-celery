@@ -262,6 +262,16 @@ class InvalidTaskError(TaskError):
     """The task has invalid data or ain't properly constructed."""
 
 
+class IncompatibleTaskProtocol(InvalidTaskError):
+    """A task message does not match the consumer protocol policy."""
+
+    def __init__(self, reason, *, protocol=None, **details):
+        self.reason = reason
+        self.protocol = protocol
+        self.details = details
+        super().__init__(reason)
+
+
 class ChordError(TaskError):
     """A task part of the chord raised an exception."""
 

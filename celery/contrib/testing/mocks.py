@@ -33,12 +33,14 @@ def TaskMessage(
         'task': name,
         'shadow': shadow,
     }
+    message.properties = {'correlation_id': id, 'reply_to': None}
     embed = {'callbacks': callbacks, 'errbacks': errbacks, 'chain': chain}
     message.headers.update(options)
     message.content_type, message.content_encoding, message.body = dumps(
         (args, kwargs, embed), serializer='json',
     )
     message.payload = (args, kwargs, embed)
+    message.decode.return_value = message.payload
     return message
 
 
@@ -73,6 +75,7 @@ def TaskMessage1(
     message.content_type, message.content_encoding, message.body = dumps(
         message.payload,
     )
+    message.decode.return_value = message.payload
     return message
 
 
