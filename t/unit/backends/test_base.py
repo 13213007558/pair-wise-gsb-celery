@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import re
+from collections import Counter
 from contextlib import contextmanager
 from unittest.mock import ANY, MagicMock, Mock, call, patch, sentinel
 from uuid import UUID
@@ -15,8 +16,8 @@ from celery.app.task import Context, Task
 from celery.backends.base import (COMPRESSED_PAYLOAD_MAGIC, BaseBackend, DisabledBackend, KeyValueStoreBackend,
                                   _create_chord_error_with_cause, _create_fake_task_request, _nulldict,
                                   compress_payload, decompress_payload)
-from celery.exceptions import (BackendGetMetaError, BackendStoreError, ChordError, ImproperlyConfigured,
-                               SecurityError, TimeoutError)
+from celery.exceptions import (BackendCleanupError, BackendGetMetaError, BackendStoreError, ChordError,
+                               ImproperlyConfigured, SecurityError, TimeoutError)
 from celery.result import GroupResult, result_from_tuple
 from celery.utils import serialization
 from celery.utils.functional import pass1
@@ -438,6 +439,9 @@ class test_prepare_exception:
 
 class KVBackend(KeyValueStoreBackend):
     mget_returns_dict = False
+    supports_result_cleanup_scan = True
+    supports_atomic_result_cleanup = True
+    supports_atomic_result_transitions = True
 
     def __init__(self, app, *args, **kwargs):
         self.db = {}
@@ -446,7 +450,7 @@ class KVBackend(KeyValueStoreBackend):
     def get(self, key):
         return self.db.get(key)
 
-    def _set_with_state(self, key, value, state):
+    def _set_with_state(self, key, value, state, ttl=None):
         self.db[key] = value
 
     def mget(self, keys):
@@ -457,6 +461,9 @@ class KVBackend(KeyValueStoreBackend):
 
     def delete(self, key):
         self.db.pop(key, None)
+
+    def _iter_cleanup_keys(self, cursor=None, limit=None):
+        return list(self.db.keys())
 
 
 class CompressingKVBackend(KVBackend):
@@ -1317,6 +1324,219 @@ class test_KeyValueStoreBackend:
         )
         stored_meta = self.b.decode(self.b.get(self.b.get_key_for_task(tid)))
         assert stored_meta['status'] == states.SUCCESS
+
+    def test_result_ttl_can_differ_by_state_and_type(self):
+        b = KVBackend(self.app, result_ttl={
+            'PENDING': 10,
+            'STARTED': 20,
+            'RETRY': 30,
+            'SUCCESS': 40,
+            'FAILURE': 50,
+            'REVOKED': 60,
+            'group': 400,
+            'chord': 300,
+            'pending_reference': 200,
+            'ignore_result': 5,
+        })
+        assert b.result_ttl_for(states.PENDING) == 10.0
+        assert b.result_ttl_for(states.STARTED) == 20.0
+        assert b.result_ttl_for(states.RETRY) == 30.0
+        assert b.result_ttl_for(states.SUCCESS) == 40.0
+        assert b.result_ttl_for(states.FAILURE) == 50.0
+        assert b.result_ttl_for(states.REVOKED) == 60.0
+        assert b.result_ttl_for(record_type='group') == 400.0
+        assert b.result_ttl_for(record_type='chord') == 300.0
+        assert b.result_ttl_for(record_type='pending_reference') == 200.0
+        assert b.result_ttl_for(ignore_result=True) == 5.0
+
+    def test_cleanup_retains_referenced_result_until_group_expires(self):
+        b = KVBackend(self.app, result_ttl={
+            'SUCCESS': 10,
+            'group': 2 * 24 * 60 * 60,
+            'pending_reference': 50,
+        })
+        task_id, group_id = uuid(), uuid()
+        b.store_result(task_id, 'value', states.SUCCESS)
+        group_result = self.app.GroupResult(group_id, [self.app.AsyncResult(task_id)])
+        b.save_group(group_id, group_result)
+
+        task_key = b.get_key_for_task(task_id)
+        group_key = b.get_key_for_group(group_id)
+        meta = b.decode(b.get(task_key))
+        group_meta = b.decode(b.get(group_key))
+        meta['date_created'] = meta['date_updated'] = meta['date_done'] = '2020-01-01T00:00:00+00:00'
+        group_meta['date_created'] = group_meta['date_updated'] = '2020-01-01T00:00:00+00:00'
+        b.db[task_key] = b.encode(meta)
+        b.db[group_key] = b.encode(group_meta)
+
+        b._cleanup_now = lambda: __import__('datetime').datetime.fromisoformat(
+            '2020-01-02T00:00:00+00:00')
+        report = b.cleanup(limit=100)
+        while report.cursor['phase'] != 'done':
+            report = b.cleanup(report.cursor, limit=100)
+
+        assert task_key in b.db
+        assert group_key in b.db
+
+        group_meta['date_created'] = group_meta['date_updated'] = '2019-12-30T00:00:00+00:00'
+        b.db[group_key] = b.encode(group_meta)
+        report = b.cleanup(limit=100)
+        while report.cursor['phase'] != 'done':
+            report = b.cleanup(report.cursor, limit=100)
+        assert task_key not in b.db
+        assert group_key not in b.db
+
+    def test_cleanup_deletes_expired_result_and_event_states_reason(self):
+        b = KVBackend(self.app, result_ttl={'SUCCESS': 10})
+        task_id = uuid()
+        b.store_result(task_id, 'value', states.SUCCESS)
+        key = b.get_key_for_task(task_id)
+        meta = b.decode(b.get(key))
+        meta.update({
+            'date_created': '2020-01-01T00:00:00+00:00',
+            'date_updated': '2020-01-01T00:00:00+00:00',
+            'date_done': '2020-01-01T00:00:00+00:00',
+        })
+        b.db[key] = b.encode(meta)
+        b._cleanup_now = lambda: __import__('datetime').datetime.fromisoformat(
+            '2020-01-02T00:00:00+00:00')
+
+        report = b.cleanup(limit=100)
+        while report.cursor['phase'] != 'done':
+            report = b.cleanup(report.cursor, limit=100)
+
+        assert report.deleted['result'] == 1
+        assert report.events[-1].reason == 'ttl_expired'
+        assert report.events[-1].type == 'result'
+        assert key not in b.db
+
+        repeat = b.cleanup(limit=100)
+        while repeat.cursor['phase'] != 'done':
+            repeat = b.cleanup(repeat.cursor, limit=100)
+        assert repeat.deleted == Counter()
+        assert repeat.events == ()
+
+    def test_cleanup_resumes_with_repeatable_cursor(self):
+        b = KVBackend(self.app, result_ttl={'SUCCESS': 10})
+        task_ids = [uuid() for _ in range(2)]
+        for task_id in task_ids:
+            b.store_result(task_id, 'value', states.SUCCESS)
+            key = b.get_key_for_task(task_id)
+            meta = b.decode(b.get(key))
+            meta.update({
+                'date_created': '2020-01-01T00:00:00+00:00',
+            'date_updated': '2020-01-01T00:00:00+00:00',
+                'date_done': '2020-01-01T00:00:00+00:00',
+            })
+            b.db[key] = b.encode(meta)
+        b._cleanup_now = lambda: __import__('datetime').datetime.fromisoformat(
+            '2020-01-02T00:00:00+00:00')
+
+        group_id = uuid()
+        b.save_group(group_id, self.app.GroupResult(group_id, [self.app.AsyncResult(uuid())]))
+        group_key = b.get_key_for_group(group_id)
+        group_meta = b.decode(b.get(group_key))
+        group_meta['date_created'] = group_meta['date_updated'] = '2020-01-01T00:00:00+00:00'
+        b.db[group_key] = b.encode(group_meta)
+
+        report = b.cleanup(limit=1)
+        phases = [report.cursor['phase']]
+        deleted = 0
+        while report.cursor['phase'] != 'done':
+            deleted += sum(report.deleted.values())
+            phases.append(report.cursor['phase'])
+            report = b.cleanup(report.cursor, limit=1)
+        deleted += sum(report.deleted.values())
+
+        assert 'references' in phases
+        assert 'aggregates' in phases
+        assert 'results' in phases
+        assert deleted == 3
+
+    def test_cleanup_conditional_delete_loses_version_race(self):
+        b = KVBackend(self.app, result_ttl={'SUCCESS': 10})
+        task_id = uuid()
+        b.store_result(task_id, 'old', states.SUCCESS)
+        key = b.get_key_for_task(task_id)
+        old = b.decode(b.get(key))
+        old.update({
+            'date_created': '2020-01-01T00:00:00+00:00',
+            'date_updated': '2020-01-01T00:00:00+00:00',
+            'date_done': '2020-01-01T00:00:00+00:00',
+        })
+        b.db[key] = b.encode(old)
+        new = dict(old, version=2, result='new')
+        b._cleanup_now = lambda: __import__('datetime').datetime.fromisoformat(
+            '2020-01-02T00:00:00+00:00')
+        original_get = b.get
+        b.get = lambda candidate: b.encode(new) if candidate == key and b._race_seen else original_get(candidate)
+        b._race_seen = False
+        record = b._cleanup_normalize_record(
+            key, b.db[key], b._cleanup_now())
+        b._race_seen = True
+        assert not b._cleanup_condition_delete(record, b._cleanup_now())
+
+    def test_pending_result_created_during_cleanup_is_not_deleted(self):
+        b = KVBackend(self.app, result_ttl={'PENDING': 60, 'SUCCESS': 10})
+        task_id = uuid()
+        b.store_result(task_id, None, states.PENDING)
+        key = b.get_key_for_task(task_id)
+        record = b._cleanup_normalize_record(key, b.get(key), b._cleanup_now())
+        assert not b._cleanup_condition_delete(record, b._cleanup_now())
+        assert key in b.db
+        with pytest.raises(BackendStoreError):
+            b.forget(task_id)
+        assert key in b.db
+
+    def test_chord_body_reference_uses_pending_reference_ttl(self):
+        b = KVBackend(self.app, result_ttl={
+            'PENDING': 10,
+            'group': 400,
+            'pending_reference': 300,
+        })
+        group_id = uuid()
+        task_ids = [uuid() for _ in range(2)]
+        body_id = uuid()
+        header_result = self.app.GroupResult(
+            group_id, [self.app.AsyncResult(task_id) for task_id in task_ids])
+        body = signature('celery.queuefeed.twitter.tasks.post_tweet', task_id=body_id)
+        pending_key = b._save_chord_body_reference(header_result, body)
+        payload = b.decode(b.get(pending_key))
+        assert payload['type'] == 'pending_reference'
+        assert payload['task_ids'] == task_ids
+        assert payload['body_task_id'] == body_id
+        assert b.result_ttl_for(record_type='pending_reference') == 300.0
+
+    def test_result_reference_marker_is_shared_across_groups(self):
+        b = KVBackend(self.app, result_ttl={
+            'group': 400,
+            'pending_reference': 300,
+        })
+        task_id = uuid()
+        first_group, second_group = uuid(), uuid()
+        header = self.app.GroupResult(first_group, [self.app.AsyncResult(task_id)])
+        second_header = self.app.GroupResult(
+            second_group, [self.app.AsyncResult(task_id)])
+        b._save_result_reference(task_id, first_group, 300)
+        b._save_result_reference(task_id, second_group, 300)
+        marker_key = b.get_key_for_task(task_id, '.ref')
+        payload = b.decode(b.get(marker_key))
+        assert payload['groups'] == sorted([first_group, second_group])
+        assert b._result_reference_exists(task_id, first_group)
+        assert b._remove_result_reference(task_id, first_group)
+        payload = b.decode(b.get(marker_key))
+        assert payload['groups'] == [second_group]
+
+    def test_cleanup_strict_reports_missing_capabilities(self):
+        b = KeyValueStoreBackend(self.app)
+        b.supports_result_cleanup_scan = False
+        with pytest.raises(BackendCleanupError, match='enumeration'):
+            b.cleanup(strict=True)
+
+        b.supports_result_cleanup_scan = True
+        b.supports_atomic_result_cleanup = False
+        with pytest.raises(BackendCleanupError, match='conditional deletion'):
+            b.cleanup(strict=True)
 
     def test_get_key_for_task_none_task_id(self):
         with pytest.raises(ValueError):

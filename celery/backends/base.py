@@ -8,8 +8,8 @@
 import sys
 import time
 import warnings
-from collections import deque, namedtuple
-from datetime import timedelta
+from collections import Counter, deque, namedtuple
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from uuid import UUID
 from weakref import WeakValueDictionary
@@ -27,8 +27,9 @@ import celery.exceptions
 from celery import current_app, group, maybe_signature, states
 from celery._state import get_current_task
 from celery.app.task import Context
-from celery.exceptions import (BackendGetMetaError, BackendStoreError, ChordError, ImproperlyConfigured,
-                               NotRegistered, SecurityError, TaskRevokedError, TimeoutError)
+from celery.exceptions import (BackendCleanupError, BackendGetMetaError, BackendStoreError, ChordError,
+                               ImproperlyConfigured, NotRegistered, SecurityError, TaskRevokedError,
+                               TimeoutError)
 from celery.result import GroupResult, ResultBase, ResultSet, allow_join_result, result_from_tuple
 from celery.utils.collections import BufferMap
 from celery.utils.functional import LRUCache, arity_greater
@@ -37,7 +38,12 @@ from celery.utils.serialization import (create_exception_cls, ensure_serializabl
                                         get_pickled_exception, raise_with_context)
 from celery.utils.time import get_exponential_backoff_interval
 
-__all__ = ('BaseBackend', 'KeyValueStoreBackend', 'DisabledBackend')
+__all__ = (
+    'BaseBackend', 'KeyValueStoreBackend', 'DisabledBackend',
+    'cleanup_event_t', 'cleanup_report_t',
+    'RESULT_CLEANUP_TYPE_RESULT', 'RESULT_CLEANUP_TYPE_GROUP',
+    'RESULT_CLEANUP_TYPE_CHORD', 'RESULT_CLEANUP_TYPE_PENDING_REFERENCE',
+)
 
 EXCEPTION_ABLE_CODECS = frozenset({'pickle'})
 
@@ -64,6 +70,35 @@ pending_results_t = namedtuple('pending_results_t', (
     'concrete', 'weak',
 ))
 
+cleanup_event_t = namedtuple('cleanup_event_t', (
+    'key', 'type', 'status', 'reason', 'expired_at', 'deleted_at',
+))
+
+cleanup_report_t = namedtuple('cleanup_report_t', (
+    'deleted', 'retained', 'scanned', 'skipped', 'cursor', 'events', 'errors',
+))
+
+RESULT_CLEANUP_TYPE_RESULT = 'result'
+RESULT_CLEANUP_TYPE_GROUP = 'group'
+RESULT_CLEANUP_TYPE_CHORD = 'chord'
+RESULT_CLEANUP_TYPE_PENDING_REFERENCE = 'pending_reference'
+
+RESULT_CLEANUP_TYPES = frozenset({
+    RESULT_CLEANUP_TYPE_RESULT,
+    RESULT_CLEANUP_TYPE_GROUP,
+    RESULT_CLEANUP_TYPE_CHORD,
+    RESULT_CLEANUP_TYPE_PENDING_REFERENCE,
+})
+
+TTL_CONFIG_STATES = (
+    states.PENDING,
+    states.STARTED,
+    states.RETRY,
+    states.SUCCESS,
+    states.FAILURE,
+    states.REVOKED,
+)
+
 E_NO_BACKEND = """
 No result backend is configured.
 Please see the documentation for more information.
@@ -86,6 +121,12 @@ Available methods are: {1}.
 W_COMPRESSION_UNSUPPORTED = """\
 The {0} result backend cannot store compressed payloads, so the
 result_compression setting is ignored and results are stored uncompressed.
+"""
+
+W_RESULT_TRANSITION_UNSUPPORTED = """\
+The {0} result backend cannot atomically compare-and-swap result versions.
+Result writes use the legacy read/write fallback, so configure a backend with
+atomic transitions for safe cleanup and retry races.
 """
 
 
@@ -168,7 +209,7 @@ class _nulldict(dict):
 def _is_request_ignore_result(request):
     if request is None:
         return False
-    return request.ignore_result
+    return getattr(request, 'ignore_result', False)
 
 
 class Backend:
@@ -201,6 +242,18 @@ class Backend:
     #: :setting:`result_compression` setting is ignored for them.
     supports_result_compression = False
 
+    #: True when cleanup can enumerate stored result records.
+    supports_result_cleanup_scan = False
+
+    #: True when cleanup can conditionally delete based on record version.
+    supports_atomic_result_cleanup = False
+
+    #: True when writes can conditionally update based on record version.
+    supports_atomic_result_transitions = False
+
+    #: True when group/chord records can receive a native per-record TTL.
+    supports_native_group_ttl = False
+
     retry_policy = {
         'max_retries': 20,
         'interval_start': 0,
@@ -222,7 +275,20 @@ class Backend:
         cmax = max_cached_results or conf.result_cache_max
         self._cache = _nulldict() if cmax == -1 else LRUCache(limit=cmax)
 
-        self.expires = self.prepare_expires(expires, expires_type)
+        legacy_expires = self.prepare_expires(expires, expires_type)
+        self.expires = legacy_expires
+        configured_result_ttl = kwargs.pop('result_ttl', None)
+        self.result_ttl = self.prepare_result_ttl(
+            configured_result_ttl,
+            fallback=legacy_expires,
+        )
+        if configured_result_ttl is not None and not self.supports_atomic_result_transitions:
+            warnings.warn(
+                W_RESULT_TRANSITION_UNSUPPORTED.format(type(self).__name__),
+                UserWarning,
+            )
+        self.result_cleanup_batch_size = self.prepare_cleanup_batch_size(
+            kwargs.pop('result_cleanup_batch_size', None))
 
         # precedence: accept, conf.result_accept_content, conf.accept_content
         self.accept = conf.result_accept_content if accept is None else accept
@@ -669,6 +735,89 @@ class Backend:
             return type(value)
         return value
 
+    def _ttl_seconds(self, value):
+        if value is None:
+            return None
+        if isinstance(value, timedelta):
+            value = value.total_seconds()
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ImproperlyConfigured(
+                f'Result TTL must be a number or timedelta, got {value!r}.'
+            ) from exc
+        if value < 0:
+            raise ImproperlyConfigured('Result TTL cannot be negative.')
+        return value if value > 0 else None
+
+    def prepare_result_ttl(self, value=None, fallback=None):
+        """Return normalized TTL configuration for states and record types."""
+        if value is None:
+            value = self.app.conf.get('result_ttl', None)
+        fallback = self._ttl_seconds(fallback)
+        if value is None:
+            configured = {}
+        elif isinstance(value, timedelta) or not isinstance(value, dict):
+            configured = {'default': value}
+        else:
+            configured = dict(value)
+
+        default = self._ttl_seconds(
+            configured.pop('default', configured.pop('result', fallback)))
+        group = self._ttl_seconds(configured.pop('group', default))
+        chord = self._ttl_seconds(configured.pop('chord', default))
+        pending_reference = self._ttl_seconds(
+            configured.pop('pending_reference', configured.pop(
+                'pending_references', default)))
+        ignore_result = self._ttl_seconds(
+            configured.pop('ignore_result', default))
+
+        states_ttl = {}
+        for state in TTL_CONFIG_STATES:
+            state_value = configured.get(state, configured.get(state.lower()))
+            states_ttl[state] = self._ttl_seconds(state_value) if state_value is not None else default
+
+        known = {'default', 'result', 'group', 'chord', 'pending_reference',
+                 'pending_references', 'ignore_result'}
+        known.update(TTL_CONFIG_STATES)
+        known.update(state.lower() for state in TTL_CONFIG_STATES)
+        unknown = sorted(set(configured) - known)
+        if unknown:
+            raise ImproperlyConfigured(
+                'Unknown result TTL keys: ' + ', '.join(unknown) + '.')
+
+        return {
+            'default': default,
+            'states': states_ttl,
+            'ignore_result': ignore_result,
+            RESULT_CLEANUP_TYPE_GROUP: group,
+            RESULT_CLEANUP_TYPE_CHORD: chord,
+            RESULT_CLEANUP_TYPE_PENDING_REFERENCE: pending_reference,
+        }
+
+    def prepare_cleanup_batch_size(self, value=None):
+        if value is None:
+            value = self.app.conf.get('result_cleanup_batch_size', 500)
+        try:
+            value = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ImproperlyConfigured(
+                f'Result cleanup batch size must be an integer, got {value!r}.'
+            ) from exc
+        if value < 1:
+            raise ImproperlyConfigured('Result cleanup batch size must be positive.')
+        return value
+
+    def result_ttl_for(self, state=None, record_type=RESULT_CLEANUP_TYPE_RESULT,
+                       ignore_result=False):
+        if record_type == RESULT_CLEANUP_TYPE_PENDING_REFERENCE:
+            return self.result_ttl[record_type]
+        if record_type in (RESULT_CLEANUP_TYPE_GROUP, RESULT_CLEANUP_TYPE_CHORD):
+            return self.result_ttl[record_type]
+        if ignore_result:
+            return self.result_ttl['ignore_result']
+        return self.result_ttl['states'].get(state, self.result_ttl['default'])
+
     def prepare_persistent(self, enabled=None):
         if enabled is not None:
             return enabled
@@ -685,13 +834,24 @@ class Backend:
 
     def _get_result_meta(self, result,
                          state, traceback, request, format_date=True,
-                         encode=False):
+                         encode=False, current_meta=None):
+        now = self.app.now()
+        timestamp = now.isoformat()
         if state in self.READY_STATES:
-            date_done = self.app.now()
+            date_done = now
             if format_date:
                 date_done = date_done.isoformat()
         else:
             date_done = None
+
+        current_meta = current_meta or {}
+        date_created = (
+            current_meta.get('date_created')
+            or current_meta.get('date_updated')
+            or current_meta.get('date_done')
+            or timestamp
+        )
+        version = int(current_meta.get('version') or 0) + 1
 
         meta = {
             'status': state,
@@ -699,6 +859,10 @@ class Backend:
             'traceback': traceback,
             'children': self.current_task_children(request),
             'date_done': date_done,
+            'date_created': date_created,
+            'date_updated': timestamp,
+            'version': version,
+            'ignore_result': bool(_is_request_ignore_result(request)),
         }
 
         if request and getattr(request, 'group', None):
@@ -922,8 +1086,315 @@ class Backend:
         self._cache.pop(group_id, None)
         return self._ensure_retryable(self._delete_group, group_id=group_id)
 
-    def cleanup(self):
-        """Backend cleanup."""
+    def _cleanup_now(self):
+        return datetime.now(timezone.utc)
+
+    def _cleanup_datetime(self, value):
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            try:
+                parsed = datetime.fromisoformat(str(value))
+            except ValueError:
+                return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _cleanup_key(self, key):
+        if isinstance(key, bytes):
+            key = key.decode('utf-8', 'surrogateescape')
+        return str(key)
+
+    def _cleanup_iter_records(self, cursor=None, limit=None, record_types=None):
+        raise NotImplementedError('backend does not implement cleanup scanning')
+
+    def _cleanup_normalize_record(self, key, raw, now):
+        raise NotImplementedError('backend does not implement record decoding')
+
+    def _cleanup_condition_delete(self, record, now, referenced=None):
+        raise NotImplementedError('backend does not implement conditional delete')
+
+    def _cleanup_record_age(self, record, now):
+        for field in ('date_created', 'date_updated', 'date_done'):
+            timestamp = self._cleanup_datetime(record.get(field))
+            if timestamp is not None:
+                return (now - timestamp).total_seconds(), field
+        return None, None
+
+    def _cleanup_record_references(self, record):
+        references = set()
+        record_type = record.get('type', RESULT_CLEANUP_TYPE_RESULT)
+        data = record.get('data') or {}
+
+        if record_type == RESULT_CLEANUP_TYPE_RESULT:
+            for child in data.get('children') or ():
+                try:
+                    references.add(str(child[0]))
+                except (IndexError, TypeError):
+                    continue
+        elif record_type == RESULT_CLEANUP_TYPE_GROUP:
+            result = data.get('result')
+            if result is not None:
+                try:
+                    nodes = result[1]
+                except (IndexError, TypeError):
+                    nodes = ()
+                for child in nodes or ():
+                    try:
+                        references.add(str(child[0][0]))
+                    except (IndexError, TypeError):
+                        try:
+                            references.add(str(child[0]))
+                        except (IndexError, TypeError):
+                            continue
+        elif record_type == RESULT_CLEANUP_TYPE_PENDING_REFERENCE:
+            if isinstance(data, dict):
+                for value in data.get('groups', ()):
+                    references.add(str(value))
+                for value in data.get('task_ids', ()):
+                    references.add(str(value))
+                if data.get('task_id'):
+                    references.add(str(data['task_id']))
+                if data.get('group_id'):
+                    references.add(str(data['group_id']))
+            body_id = data.get('body_task_id') if isinstance(data, dict) else None
+            if body_id:
+                references.add(str(body_id))
+
+        return references
+
+    def _cleanup_referenced_ids(self, records):
+        referenced = set()
+        for record in records:
+            referenced.update(self._cleanup_record_references(record))
+        return referenced
+
+    def _cleanup_record_ttl(self, record):
+        record_type = record.get('type', RESULT_CLEANUP_TYPE_RESULT)
+        status = record.get('status') or states.SUCCESS
+        data = record.get('data') or {}
+        if record_type == RESULT_CLEANUP_TYPE_PENDING_REFERENCE:
+            ttl = data.get('ttl')
+            if ttl is not None:
+                return self._ttl_seconds(ttl)
+        return self.result_ttl_for(
+            state=status,
+            record_type=record_type,
+            ignore_result=bool(data.get('ignore_result')),
+        )
+
+    def _cleanup_event(self, record, reason, now, age_field=None, ttl=None):
+        expired_at = None
+        timestamp = self._cleanup_datetime(record.get(age_field)) if age_field else None
+        if timestamp is not None and ttl is not None:
+            expired_at = (timestamp + timedelta(seconds=ttl)).isoformat()
+        return cleanup_event_t(
+            key=record.get('key'),
+            type=record.get('type', RESULT_CLEANUP_TYPE_RESULT),
+            status=record.get('status'),
+            reason=reason,
+            expired_at=expired_at,
+            deleted_at=now.isoformat(),
+        )
+
+    def _cleanup_report(self, deleted, retained, scanned, skipped,
+                        cursor, events, errors=None):
+        return cleanup_report_t(
+            deleted=Counter(deleted),
+            retained=Counter(retained),
+            scanned=Counter(scanned),
+            skipped=Counter(skipped),
+            cursor=cursor,
+            events=tuple(events),
+            errors=tuple(errors or ()),
+        )
+
+    def cleanup(self, cursor=None, limit=None, strict=False, dry_run=False):
+        """Delete expired results and return an idempotent cleanup report."""
+        cursor = dict(cursor or {})
+        limit = self.result_cleanup_batch_size if limit is None else int(limit)
+        if limit < 1:
+            raise ImproperlyConfigured('Result cleanup batch size must be positive.')
+
+        def unsupported(exc, reason):
+            if strict:
+                raise BackendCleanupError(
+                    f'{type(self).__name__} cannot safely run result cleanup: {exc}'
+                ) from exc
+            return None
+
+        if not self.supports_result_cleanup_scan:
+            return unsupported(
+                NotImplementedError('result enumeration is unsupported'),
+                'unsupported_scan')
+        if not self.supports_atomic_result_cleanup:
+            return unsupported(
+                NotImplementedError('conditional deletion is unsupported'),
+                'unsupported_conditional_delete')
+
+        now = self._cleanup_now()
+        aggregate_types = (
+            RESULT_CLEANUP_TYPE_GROUP,
+            RESULT_CLEANUP_TYPE_CHORD,
+            RESULT_CLEANUP_TYPE_PENDING_REFERENCE,
+        )
+
+        phase = cursor.get('phase', 'references')
+        referenced = set(cursor.get('referenced', ()))
+        if not cursor.get('complete', True):
+            scan_state = {
+                'scan_cursor': cursor.get('scan_cursor', 0),
+                'pattern_index': cursor.get('pattern_index', 0),
+            }
+        else:
+            scan_state = {'scan_cursor': 0, 'pattern_index': 0}
+
+        def scan(after_key, record_types):
+            batch = list(self._cleanup_iter_records(
+                cursor={'after_key': after_key, **scan_state}, limit=limit,
+                record_types=record_types))
+            normalized = []
+            for key, raw in batch:
+                try:
+                    record = self._cleanup_normalize_record(key, raw, now)
+                except Exception as exc:
+                    continue
+                if record_types is None or record['type'] in record_types:
+                    normalized.append(record)
+            has_more = len(batch) == limit or getattr(
+                self, '_last_cleanup_scan_cursor', 0) not in (0, '0', None)
+            scan_cursor = getattr(self, '_last_cleanup_scan_cursor', 0)
+            pattern_index = getattr(self, '_last_cleanup_pattern_index', 0)
+            return normalized, has_more, scan_cursor, pattern_index
+
+        events = []
+        counters = {
+            'deleted': Counter(), 'retained': Counter(), 'scanned': Counter(),
+            'skipped': Counter(),
+        }
+        errors = []
+
+        if phase == 'references':
+            records, has_more, scan_cursor, pattern_index = scan(
+                cursor.get('after_key'), aggregate_types)
+            for record in records:
+                counters['scanned'][record['type']] += 1
+                referenced.update(self._cleanup_record_references(record))
+            next_cursor = {
+                'phase': 'aggregates',
+                'after_key': None,
+                'referenced': sorted(referenced),
+                'scan_cursor': scan_cursor,
+                'pattern_index': pattern_index,
+                'limit': limit,
+                'complete': not has_more,
+            }
+            if has_more:
+                next_cursor['phase'] = 'references'
+                next_cursor['after_key'] = records[-1]['key']
+                next_cursor['complete'] = False
+            return self._cleanup_report(
+                counters['deleted'], counters['retained'], counters['scanned'],
+                counters['skipped'], next_cursor, events, errors)
+
+        if phase == 'aggregates':
+            records, has_more, scan_cursor, pattern_index = scan(
+                cursor.get('after_key'), aggregate_types)
+            for record in records:
+                counters['scanned'][record['type']] += 1
+                current_references = self._cleanup_record_references(record)
+                referenced.update(current_references)
+                protected = referenced - {record.get('id')}
+                deleted = self._cleanup_expire_record(
+                    record, now, protected, dry_run, counters, events, errors, strict)
+                if deleted:
+                    if record['type'] == RESULT_CLEANUP_TYPE_GROUP:
+                        self.delete(self.get_key_for_group(record['id'], '.pending'))
+                        for referenced_id in current_references:
+                            self._remove_result_reference(referenced_id, record['id'])
+                    referenced.difference_update(current_references)
+            next_cursor = {
+                'phase': 'results',
+                'after_key': None,
+                'referenced': sorted(referenced),
+                'scan_cursor': scan_cursor,
+                'pattern_index': pattern_index,
+                'limit': limit,
+                'complete': not has_more,
+            }
+            if has_more:
+                next_cursor['phase'] = 'aggregates'
+                next_cursor['after_key'] = records[-1]['key']
+                next_cursor['complete'] = False
+            return self._cleanup_report(
+                counters['deleted'], counters['retained'], counters['scanned'],
+                counters['skipped'], next_cursor, events, errors)
+
+        records, has_more, scan_cursor, pattern_index = scan(
+            cursor.get('after_key'), (RESULT_CLEANUP_TYPE_RESULT,))
+        for record in records:
+            counters['scanned'][record['type']] += 1
+            self._cleanup_expire_record(
+                record, now, referenced, dry_run, counters, events, errors, strict)
+        next_cursor = {
+            'phase': 'done',
+            'after_key': records[-1]['key'] if records and has_more else None,
+            'referenced': sorted(referenced),
+            'scan_cursor': scan_cursor,
+            'pattern_index': pattern_index,
+            'limit': limit,
+            'complete': not has_more,
+        }
+        if has_more:
+            next_cursor['phase'] = 'results'
+        return self._cleanup_report(
+            counters['deleted'], counters['retained'], counters['scanned'],
+            counters['skipped'], next_cursor, events, errors)
+
+    def _cleanup_expire_record(self, record, now, referenced, dry_run,
+                                counters, events, errors, strict):
+        record_type = record['type']
+        ttl = self._cleanup_record_ttl(record)
+        age, age_field = self._cleanup_record_age(record, now)
+        if ttl is None:
+            counters['retained'][record_type] += 1
+            return False
+        if age is None:
+            counters['retained'][record_type] += 1
+            return False
+        if age < ttl:
+            counters['retained'][record_type] += 1
+            return False
+        if record_type == RESULT_CLEANUP_TYPE_PENDING_REFERENCE and record.get('id') in referenced:
+            counters['retained'][record_type] += 1
+            return False
+        if record.get('id') in referenced:
+            counters['retained'][record_type] += 1
+            return False
+        if dry_run:
+            counters['skipped'][record_type] += 1
+            events.append(self._cleanup_event(record, 'dry_run', now, age_field, ttl))
+            return False
+
+        try:
+            deleted = self._cleanup_condition_delete(record, now, referenced)
+        except NotImplementedError as exc:
+            if strict:
+                raise BackendCleanupError(
+                    f'{type(self).__name__} cannot conditionally delete {record.get("key")!r}.'
+                ) from exc
+            counters['skipped'][record_type] += 1
+            errors.append(str(exc))
+            return False
+        if deleted:
+            counters['deleted'][record_type] += 1
+            events.append(self._cleanup_event(record, 'ttl_expired', now, age_field, ttl))
+            return True
+        counters['retained'][record_type] += 1
+        return False
 
     def process_cleanup(self):
         """Cleanup actions to do at the end of a task worker process."""
@@ -939,6 +1410,28 @@ class Backend:
 
     def set_chord_size(self, group_id, chord_size):
         pass
+
+    def _chord_body_task_id(self, body):
+        options = getattr(body, 'options', {}) or {}
+        return options.get('task_id') or getattr(body, 'id', None)
+
+    def _save_result_reference(self, task_id, group_id, ttl):
+        return None
+
+    def _result_reference_exists(self, task_id, group_id=None, referenced=None):
+        return False
+
+    def _remove_result_reference(self, task_id, group_id):
+        return False
+
+    def _save_chord_body_reference(self, header_result, body):
+        body_task_id = self._chord_body_task_id(body)
+        ttl = self.result_ttl_for(record_type=RESULT_CLEANUP_TYPE_PENDING_REFERENCE)
+        for result in header_result.results:
+            self._save_result_reference(result.id, header_result.id, ttl)
+        if body_task_id:
+            self._save_result_reference(body_task_id, header_result.id, ttl)
+        return body_task_id
 
     def fallback_chord_unlock(self, header_result, body, countdown=1,
                               **kwargs):
@@ -990,6 +1483,7 @@ class Backend:
     def apply_chord(self, header_result_args, body, **kwargs):
         self.ensure_chords_allowed()
         header_result = self.app.GroupResult(*header_result_args)
+        self._save_chord_body_reference(header_result, body)
         self.fallback_chord_unlock(header_result, body, **kwargs)
 
     def current_task_children(self, request=None):
@@ -1097,6 +1591,9 @@ class BaseKeyValueStoreBackend(Backend):
     group_keyprefix = 'celery-taskset-meta-'
     chord_keyprefix = 'chord-unlock-'
     implements_incr = False
+    supports_result_cleanup_scan = False
+    supports_atomic_result_cleanup = False
+    supports_atomic_result_transitions = False
 
     def __init__(self, *args, **kwargs):
         if hasattr(self.key_t, '__func__'):  # pragma: no cover
@@ -1133,7 +1630,7 @@ class BaseKeyValueStoreBackend(Backend):
     def mget(self, keys):
         raise NotImplementedError('Does not support get_many')
 
-    def _set_with_state(self, key, value, state):
+    def _set_with_state(self, key, value, state, ttl=None):
         return self.set(key, value)
 
     def set(self, key, value):
@@ -1150,26 +1647,25 @@ class BaseKeyValueStoreBackend(Backend):
 
     def get_key_for_task(self, task_id, key=''):
         """Get the cache key for a task by id."""
-        if not task_id:
+        if task_id is None or task_id == '':
             raise ValueError(f'task_id must not be empty. Got {task_id} instead.')
         return self._get_key_for(self.task_keyprefix, task_id, key)
 
     def get_key_for_group(self, group_id, key=''):
         """Get the cache key for a group by id."""
-        if not group_id:
+        if group_id is None or group_id == '':
             raise ValueError(f'group_id must not be empty. Got {group_id} instead.')
         return self._get_key_for(self.group_keyprefix, group_id, key)
 
     def get_key_for_chord(self, group_id, key=''):
         """Get the cache key for the chord waiting on group with given id."""
-        if not group_id:
+        if group_id is None or group_id == '':
             raise ValueError(f'group_id must not be empty. Got {group_id} instead.')
         return self._get_key_for(self.chord_keyprefix, group_id, key)
 
     def _get_key_for(self, prefix, id, key=''):
         key_t = self.key_t
-        if isinstance(id, UUID):
-            id = str(id)
+        id = str(id) if isinstance(id, UUID) else str(id)
 
         return key_t('').join([
             prefix, key_t(id), key_t(key),
@@ -1189,6 +1685,156 @@ class BaseKeyValueStoreBackend(Backend):
                 value = self.decode_result(value)
                 if value['status'] in READY_STATES:
                     yield k, value
+
+    def _iter_cleanup_keys(self, cursor=None, limit=None):
+        raise NotImplementedError('backend does not implement key enumeration')
+
+    def _cleanup_scan_cursor(self, cursor):
+        scan_cursor = (cursor or {}).get('scan_cursor')
+        return 0 if scan_cursor is None else scan_cursor
+
+    def _cleanup_scan_state(self, cursor):
+        return {
+            'scan_cursor': self._cleanup_scan_cursor(cursor),
+            'pattern_index': (cursor or {}).get('pattern_index', 0),
+        }
+
+    def _cleanup_key_type(self, key):
+        key = self.key_t(key)
+        if key.startswith(self.task_keyprefix):
+            identifier = key[len(self.task_keyprefix):]
+            if identifier.endswith(self.key_t('.ref')):
+                return RESULT_CLEANUP_TYPE_PENDING_REFERENCE
+            return RESULT_CLEANUP_TYPE_RESULT
+        if key.startswith(self.group_keyprefix):
+            suffix = key[len(self.group_keyprefix):]
+            if suffix.startswith(self.key_t('.pending')):
+                return RESULT_CLEANUP_TYPE_PENDING_REFERENCE
+            if suffix.startswith(self.key_t('.')):
+                return RESULT_CLEANUP_TYPE_CHORD
+            return RESULT_CLEANUP_TYPE_GROUP
+        if key.startswith(self.chord_keyprefix):
+            return RESULT_CLEANUP_TYPE_CHORD
+        return None
+
+    def _cleanup_record_id(self, key, record_type):
+        key = self.key_t(key)
+        if record_type == RESULT_CLEANUP_TYPE_RESULT:
+            return bytes_to_str(key[len(self.task_keyprefix):])
+        if record_type == RESULT_CLEANUP_TYPE_PENDING_REFERENCE and key.startswith(self.task_keyprefix):
+            identifier = bytes_to_str(key[len(self.task_keyprefix):])
+            return identifier[:-len('.ref')] if identifier.endswith('.ref') else identifier
+        if record_type == RESULT_CLEANUP_TYPE_GROUP:
+            identifier = bytes_to_str(key[len(self.group_keyprefix):])
+            return identifier.split('.', 1)[0]
+        if record_type == RESULT_CLEANUP_TYPE_PENDING_REFERENCE:
+            identifier = bytes_to_str(key[len(self.group_keyprefix):])
+            return identifier.split('.', 1)[0]
+        return bytes_to_str(self._strip_prefix(key))
+
+    def _cleanup_iter_records(self, cursor=None, limit=None, record_types=None):
+        cursor = cursor or {}
+        selected = []
+        result = self._iter_cleanup_keys(cursor=cursor, limit=limit)
+        if isinstance(result, tuple):
+            keys, scan_cursor = result
+            keys = list(keys)
+        else:
+            keys = list(result)
+            scan_cursor = 0
+            self._last_cleanup_pattern_index = 0
+        while len(selected) < limit:
+            after_key = cursor.get('after_key')
+            if after_key is not None:
+                after_key = self.key_t(after_key)
+                keys = [key for key in keys if self.key_t(key) > after_key]
+            for key in sorted(keys, key=self.key_t):
+                if record_types is None or self._cleanup_key_type(key) in record_types:
+                    selected.append(key)
+                    if len(selected) == limit:
+                        break
+            if scan_cursor in (0, '0', None):
+                break
+            keys, scan_cursor = self._iter_cleanup_keys(
+                cursor=dict(cursor, scan_cursor=scan_cursor), limit=limit)
+            keys = list(keys)
+        self._last_cleanup_scan_cursor = scan_cursor
+        return [(key, self.get(key)) for key in selected[:limit]]
+
+    def _cleanup_normalize_record(self, key, raw, now):
+        key = self.key_t(key)
+        record_type = self._cleanup_key_type(key) or RESULT_CLEANUP_TYPE_RESULT
+        record_id = self._cleanup_record_id(key, record_type)
+        if raw is None:
+            raise KeyError(key)
+
+        if record_type == RESULT_CLEANUP_TYPE_RESULT:
+            data = self.decode_result(raw)
+            status = data.get('status', states.PENDING)
+        else:
+            data = self.decode(raw)
+            status = states.SUCCESS
+            if record_type == RESULT_CLEANUP_TYPE_PENDING_REFERENCE:
+                status = data.get('status', states.PENDING)
+
+        return {
+            'key': bytes_to_str(key),
+            'id': record_id,
+            'type': record_type,
+            'status': status,
+            'data': data,
+            'raw': raw,
+            'version': data.get('version'),
+            'date_created': data.get('date_created'),
+            'date_updated': data.get('date_updated'),
+            'date_done': data.get('date_done'),
+        }
+
+    def _cleanup_condition_delete(self, record, now, referenced=None):
+        key = self.key_t(record['key'])
+        current = self.get(key)
+        if current is None:
+            return False
+        try:
+            current_data = self.decode(current)
+        except Exception:
+            return False
+        if current_data.get('version') != record['data'].get('version'):
+            return False
+        age, age_field = self._cleanup_record_age(
+            {
+                'date_created': current_data.get('date_created'),
+                'date_updated': current_data.get('date_updated'),
+                'date_done': current_data.get('date_done'),
+            }, now)
+        ttl = self._cleanup_record_ttl({
+            'type': record['type'],
+            'status': current_data.get('status', record['status']),
+            'data': current_data,
+        })
+        if ttl is None or age is None or age < ttl:
+            return False
+        if record['type'] == RESULT_CLEANUP_TYPE_RESULT and self._result_reference_exists(
+                record['id'], referenced=referenced):
+            return False
+        self.delete(key)
+        return True
+
+    def _compare_and_set_result(self, task_id, encoded, state, expected_version):
+        key = self.get_key_for_task(task_id)
+        current = self.get(key)
+        current_meta = self.decode_result(current) if current else {
+            'status': states.PENDING,
+            'version': 0,
+        }
+        current_version = current_meta.get('version', 0)
+        if current_version != expected_version and not (
+                current_version == 0 and
+                current_meta.get('status') == states.PENDING):
+            return False
+        self._set_with_state(
+            key, encoded, state, ttl=self.result_ttl_for(state=state))
+        return True
 
     def _mget_to_results(self, values, keys, READY_STATES=states.READY_STATES):
         if hasattr(values, 'items'):
@@ -1255,36 +1901,154 @@ class BaseKeyValueStoreBackend(Backend):
                 break
 
     def _forget(self, task_id):
-        self.delete(self.get_key_for_task(task_id))
+        if not self._condition_forget(task_id):
+            raise BackendStoreError(
+                'cannot forget a result that is not ready',
+                task_id=bytes_to_str(task_id))
+
+    def _condition_forget(self, task_id, ready=True):
+        key = self.get_key_for_task(task_id)
+        raw = self.get(key)
+        if raw is None:
+            return True
+        meta = self.decode_result(raw)
+        if ready and meta.get('status') not in self.READY_STATES:
+            return False
+        self.delete(key)
+        return True
 
     def _store_result(self, task_id, result, state,
                       traceback=None, request=None, **kwargs):
-        meta = self._get_result_meta(result=result, state=state,
-                                     traceback=traceback, request=request)
-        meta['task_id'] = bytes_to_str(task_id)
-
-        # Retrieve metadata from the backend, if the status
-        # is a success then we ignore any following update to the state.
-        # This solves a task deduplication issue because of network
-        # partitioning or lost workers. This issue involved a race condition
-        # making a lost task overwrite the last successful result in the
-        # result backend.
         current_meta = self._get_task_meta_for(task_id)
-
         if current_meta['status'] == states.SUCCESS:
             return result
 
-        try:
-            self._set_with_state(self.get_key_for_task(task_id), self.encode(meta), state)
-        except BackendStoreError as ex:
-            raise BackendStoreError(str(ex), state=state, task_id=task_id) from ex
+        meta = self._get_result_meta(
+            result=result, state=state, traceback=traceback,
+            request=request, current_meta=current_meta)
+        meta['task_id'] = bytes_to_str(task_id)
+        encoded = self.encode(meta)
+        expected_version = int(current_meta.get('version') or 0)
+
+        if self.supports_atomic_result_transitions:
+            if not self._compare_and_set_result(task_id, encoded, state, expected_version):
+                if self._get_task_meta_for(task_id)['status'] == states.SUCCESS:
+                    return result
+                raise BackendStoreError(
+                    'result version changed while storing',
+                    state=state, task_id=bytes_to_str(task_id))
+        else:
+            if self.app.conf.get('result_ttl') is not None:
+                warnings.warn(
+                    W_RESULT_TRANSITION_UNSUPPORTED.format(type(self).__name__),
+                    UserWarning,
+                )
+            try:
+                ttl = self.result_ttl_for(state=state)
+                self._set_with_state(
+                    self.get_key_for_task(task_id), encoded, state, ttl=ttl)
+            except BackendStoreError as ex:
+                raise BackendStoreError(
+                    str(ex), state=state, task_id=bytes_to_str(task_id)) from ex
 
         return result
 
     def _save_group(self, group_id, result):
-        self._set_with_state(self.get_key_for_group(group_id),
-                             self.encode({'result': result.as_tuple()}), states.SUCCESS)
+        timestamp = self.app.now().isoformat()
+        meta = {
+            'result': result.as_tuple(),
+            'date_created': timestamp,
+            'date_updated': timestamp,
+            'version': 1,
+        }
+        self._set_with_state(
+            self.get_key_for_group(group_id), self.encode(meta), states.SUCCESS,
+            ttl=self.result_ttl_for(record_type=RESULT_CLEANUP_TYPE_GROUP))
+        reference_ttl = self.result_ttl_for(
+            record_type=RESULT_CLEANUP_TYPE_PENDING_REFERENCE)
+        for child in result.results:
+            self._save_result_reference(child.id, group_id, reference_ttl)
         return result
+
+    def _save_pending_reference(self, group_id, data, reference_type):
+        timestamp = self.app.now().isoformat()
+        payload = dict(
+            data, type=reference_type, status=states.PENDING,
+            date_created=timestamp, date_updated=timestamp, version=1)
+        self._set_with_state(
+            self.get_key_for_group(group_id, '.pending'),
+            self.encode(payload), states.PENDING,
+            ttl=self.result_ttl_for(
+                record_type=RESULT_CLEANUP_TYPE_PENDING_REFERENCE))
+        return payload
+
+    def _save_result_reference(self, task_id, group_id, ttl):
+        ttl = ttl if ttl is not None else self.result_ttl_for(
+            record_type=RESULT_CLEANUP_TYPE_PENDING_REFERENCE)
+        group_ttl = self.result_ttl_for(record_type=RESULT_CLEANUP_TYPE_GROUP)
+        if ttl is None:
+            ttl = group_ttl
+        elif group_ttl is not None:
+            ttl = max(ttl, group_ttl)
+        timestamp = self.app.now().isoformat()
+        key = self.get_key_for_task(task_id, '.ref')
+        groups = {str(group_id)}
+        raw = self.get(key)
+        if raw is not None:
+            current = self.decode(raw)
+            groups.update(str(group) for group in current.get('groups', ()))
+            current_ttl = self._ttl_seconds(current.get('ttl'))
+            if current_ttl is not None:
+                ttl = current_ttl if ttl is None else max(ttl, current_ttl)
+        payload = {
+            'type': RESULT_CLEANUP_TYPE_PENDING_REFERENCE,
+            'status': states.PENDING,
+            'task_id': task_id,
+            'groups': sorted(groups),
+            'ttl': ttl,
+            'date_created': timestamp,
+            'date_updated': timestamp,
+            'version': 1,
+        }
+        self._set_with_state(
+            key,
+            self.encode(payload), states.PENDING, ttl=ttl)
+        return payload
+
+    def _result_reference_exists(self, task_id, group_id=None, referenced=None):
+        for candidate_group_id in referenced or [group_id]:
+            if candidate_group_id is None:
+                continue
+            marker = self.get(self.get_key_for_task(task_id, '.ref'))
+            if marker is None:
+                continue
+            try:
+                payload = self.decode(marker)
+            except Exception:
+                return True
+            groups = payload.get('groups', ())
+            if str(candidate_group_id) in {str(group) for group in groups}:
+                return True
+        return False
+
+    def _remove_result_reference(self, task_id, group_id):
+        key = self.get_key_for_task(task_id, '.ref')
+        raw = self.get(key)
+        if raw is None:
+            return False
+        payload = self.decode(raw)
+        groups = {str(group) for group in payload.get('groups', ())}
+        groups.discard(str(group_id))
+        if not groups:
+            self.delete(key)
+        else:
+            payload['groups'] = sorted(groups)
+            payload['date_updated'] = self.app.now().isoformat()
+            payload['version'] = int(payload.get('version') or 0) + 1
+            self._set_with_state(
+                key, self.encode(payload), states.PENDING,
+                ttl=self._ttl_seconds(payload.get('ttl')))
+        return True
 
     def _delete_group(self, group_id):
         self.delete(self.get_key_for_group(group_id))
@@ -1327,7 +2091,22 @@ class BaseKeyValueStoreBackend(Backend):
     def _apply_chord_incr(self, header_result_args, body, **kwargs):
         self.ensure_chords_allowed()
         header_result = self.app.GroupResult(*header_result_args)
+        self._save_chord_body_reference(header_result, body)
         header_result.save(backend=self)
+
+    def _save_chord_body_reference(self, header_result, body):
+        body_task_id = self._chord_body_task_id(body)
+        reference_ttl = self.result_ttl_for(
+            record_type=RESULT_CLEANUP_TYPE_PENDING_REFERENCE)
+        for result in header_result.results:
+            self._save_result_reference(result.id, header_result.id, reference_ttl)
+        if body_task_id:
+            self._save_result_reference(body_task_id, header_result.id, reference_ttl)
+        self._save_pending_reference(header_result.id, {
+            'task_ids': [result.id for result in header_result.results],
+            'body_task_id': body_task_id,
+        }, RESULT_CLEANUP_TYPE_PENDING_REFERENCE)
+        return self.get_key_for_group(header_result.id, '.pending')
 
     def on_chord_part_return(self, request, state, result, **kwargs):
         if not self.implements_incr:
@@ -1396,6 +2175,17 @@ class BaseKeyValueStoreBackend(Backend):
             finally:
                 deps.delete()
                 self.delete(key)
+                pending_key = self.get_key_for_group(gid, '.pending')
+                pending_raw = self.get(pending_key)
+                reference_ids = []
+                if pending_raw is not None:
+                    pending_payload = self.decode(pending_raw)
+                    reference_ids.extend(pending_payload.get('task_ids', ()))
+                    if pending_payload.get('body_task_id'):
+                        reference_ids.append(pending_payload['body_task_id'])
+                    self.delete(pending_key)
+                for reference_id in set(reference_ids):
+                    self._remove_result_reference(reference_id, gid)
         else:
             self.expire(key, self.expires)
 

@@ -438,7 +438,15 @@ class BaseResultConsumer:
                 # before it was added to _pending_results.
                 self._pending_messages.put(task_id, meta)
             else:
-                result._maybe_set_cache(meta)
+                cached = getattr(result, '_cache', None)
+                cached_version = int((cached or {}).get('version') or 0)
+                incoming_version = int(meta.get('version') or 0)
+                is_newer = incoming_version >= cached_version
+                if is_newer:
+                    result._maybe_set_cache(meta)
+                else:
+                    sleep(0)
+                    return
                 buckets = self.buckets
                 try:
                     # remove bucket for this result, since it's fulfilled
@@ -447,5 +455,6 @@ class BaseResultConsumer:
                     pass
                 else:
                     # send to waiter via bucket
-                    bucket.append(result)
+                    if is_newer:
+                        bucket.append(result)
         sleep(0)

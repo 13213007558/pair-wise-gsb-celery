@@ -94,6 +94,7 @@ class CacheBackend(KeyValueStoreBackend):
     supports_autoexpire = True
     supports_native_join = True
     implements_incr = True
+    supports_native_group_ttl = True
 
     def __init__(self, app, expires=None, backend=None,
                  options=None, url=None, **kwargs):
@@ -124,6 +125,9 @@ class CacheBackend(KeyValueStoreBackend):
 
     def set(self, key, value):
         return self.client.set(key, value, self.expires)
+
+    def _set_with_state(self, key, value, state, ttl=None):
+        return self.client.set(key, value, ttl if ttl is not None else self.expires)
 
     def delete(self, key):
         return self.client.delete(key)

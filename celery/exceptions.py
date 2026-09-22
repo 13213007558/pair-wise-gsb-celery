@@ -22,6 +22,7 @@ Error Hierarchy
             - :exc:`~celery.exceptions.InvalidTaskError`
             - :exc:`~celery.exceptions.ChordError`
         - :exc:`~celery.exceptions.BackendError`
+            - :exc:`~celery.exceptions.BackendCleanupError`
             - :exc:`~celery.exceptions.BackendGetMetaError`
             - :exc:`~celery.exceptions.BackendStoreError`
     - :class:`kombu.exceptions.KombuError`
@@ -83,7 +84,8 @@ __all__ = (
     'InvalidTaskError', 'ChordError',
 
     # Backend related errors.
-    'BackendError', 'BackendGetMetaError', 'BackendStoreError',
+    'BackendError', 'BackendCleanupError',
+    'BackendGetMetaError', 'BackendStoreError',
 
     # Billiard task errors.
     'SoftTimeLimitExceeded', 'TimeLimitExceeded',
@@ -287,6 +289,10 @@ class WorkerShutdown(SystemExit):
 
 class BackendError(Exception):
     """An issue writing or reading to/from the backend."""
+
+
+class BackendCleanupError(BackendError):
+    """Result cleanup could not be performed safely."""
 
 
 class BackendGetMetaError(BackendError):

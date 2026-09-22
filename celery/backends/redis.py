@@ -226,6 +226,9 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
 
     supports_autoexpire = True
     supports_native_join = True
+    supports_atomic_result_transitions = True
+    supports_result_cleanup_scan = True
+    supports_atomic_result_cleanup = True
     # Redis preserves binary payloads; response decoding disables compression.
     supports_result_compression = True
 
@@ -542,10 +545,14 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
 
         return self.ensure(self._set, (key, value), **retry_policy)
 
-    def _set(self, key, value):
+    def _set_with_state(self, key, value, state, ttl=None):
+        return self.ensure(self._set, (key, value), ttl=ttl)
+
+    def _set(self, key, value, ttl=None):
         with self.client.pipeline() as pipe:
-            if self.expires:
-                pipe.setex(key, self.expires, value)
+            ttl = ttl or self.expires
+            if ttl:
+                pipe.setex(key, int(ttl), value)
             else:
                 pipe.set(key, value)
             pipe.publish(key, value)
@@ -558,11 +565,217 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
     def delete(self, key):
         self.client.delete(key)
 
+    def _condition_forget(self, task_id, ready=True):
+        key = self.get_key_for_task(task_id)
+        with self.client.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(key)
+                    raw = pipe.get(key)
+                    if raw is None:
+                        pipe.unwatch()
+                        return True
+                    meta = self.decode_result(raw)
+                    if ready and meta.get('status') not in self.READY_STATES:
+                        pipe.unwatch()
+                        return False
+                    pipe.multi()
+                    pipe.delete(key)
+                    pipe.execute()
+                    return True
+                except self.redis.WatchError:
+                    continue
+                finally:
+                    pipe.reset()
+
+    def _iter_cleanup_keys(self, cursor=None, limit=None):
+        index = int((cursor or {}).get('pattern_index', 0))
+        patterns = (
+            self.task_keyprefix + b'*',
+            self.group_keyprefix + b'*',
+            self.chord_keyprefix + b'*',
+        )
+        scan_cursor = int((cursor or {}).get('scan_cursor') or 0)
+        keys = []
+        while index < len(patterns):
+            scan_cursor, batch = self.client.scan(
+                cursor=scan_cursor, match=patterns[index], count=limit)
+            keys = list(batch)
+            if scan_cursor == 0:
+                index += 1
+                scan_cursor = 0
+            if keys:
+                break
+        self._last_cleanup_pattern_index = index
+        return keys, scan_cursor
+
     def incr(self, key):
         return self.client.incr(key)
 
     def expire(self, key, value):
         return self.client.expire(key, value)
+
+    def _compare_and_set_result(self, task_id, encoded, state, expected_version):
+        key = self.get_key_for_task(task_id)
+        ttl = int(self.result_ttl_for(state=state) or 0)
+        with self.client.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(key)
+                    current = pipe.get(key)
+                    current_version = 0
+                    if current is not None:
+                        try:
+                            current_version = int(self.decode(current).get('version') or 0)
+                        except Exception:
+                            break
+                    if current_version != expected_version:
+                        pipe.unwatch()
+                        return False
+                    pipe.multi()
+                    if ttl:
+                        pipe.setex(key, ttl, encoded)
+                    else:
+                        pipe.set(key, encoded)
+                    pipe.publish(key, encoded)
+                    pipe.execute()
+                    return True
+                except self.redis.WatchError:
+                    continue
+                finally:
+                    pipe.reset()
+
+    def _save_result_reference(self, task_id, group_id, ttl):
+        key = self.get_key_for_task(task_id, '.ref')
+        ttl = ttl if ttl is not None else self.result_ttl_for(record_type='pending_reference')
+        group_ttl = self.result_ttl_for(record_type='group')
+        if ttl is None:
+            ttl = group_ttl
+        elif group_ttl is not None:
+            ttl = max(ttl, group_ttl)
+        timestamp = self.app.now().isoformat()
+        with self.client.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(key)
+                    raw = pipe.get(key)
+                    groups = {str(group_id)}
+                    if raw is not None:
+                        current = self.decode(raw)
+                        groups.update(str(group) for group in current.get('groups', ()))
+                    payload = self.encode({
+                        'type': 'pending_reference',
+                        'status': states.PENDING,
+                        'task_id': str(task_id),
+                        'groups': sorted(groups),
+                        'ttl': ttl,
+                        'date_created': current.get('date_created', timestamp) if raw is not None else timestamp,
+                        'date_updated': timestamp,
+                        'version': int((current.get('version') if raw is not None else 0) or 0) + 1,
+                    })
+                    pipe.multi()
+                    if ttl:
+                        pipe.setex(key, int(ttl), payload)
+                    else:
+                        pipe.set(key, payload)
+                    pipe.execute()
+                    return payload
+                except self.redis.WatchError:
+                    continue
+                finally:
+                    pipe.reset()
+
+    def _result_reference_exists(self, task_id, group_id=None, referenced=None):
+        raw = self.get(self.get_key_for_task(task_id, '.ref'))
+        if raw is None:
+            return False
+        groups = {str(group) for group in self.decode(raw).get('groups', ())}
+        return bool(groups.intersection(str(value) for value in (referenced or [group_id])))
+
+    def _remove_result_reference(self, task_id, group_id):
+        key = self.get_key_for_task(task_id, '.ref')
+        with self.client.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(key)
+                    raw = pipe.get(key)
+                    if raw is None:
+                        pipe.unwatch()
+                        return False
+                    payload = self.decode(raw)
+                    groups = {str(group) for group in payload.get('groups', ())}
+                    groups.discard(str(group_id))
+                    pipe.multi()
+                    if groups:
+                        payload['groups'] = sorted(groups)
+                        payload['date_updated'] = self.app.now().isoformat()
+                        payload['version'] = int(payload.get('version') or 0) + 1
+                        encoded = self.encode(payload)
+                        ttl = self._ttl_seconds(payload.get('ttl'))
+                        if ttl:
+                            pipe.setex(key, int(ttl), encoded)
+                        else:
+                            pipe.set(key, encoded)
+                    else:
+                        pipe.delete(key)
+                    pipe.execute()
+                    return True
+                except self.redis.WatchError:
+                    continue
+                finally:
+                    pipe.reset()
+
+    def _cleanup_condition_delete(self, record, now, referenced=None):
+        key = self.key_t(record['key'])
+        marker_key = None
+        group_type = self._cleanup_key_type(key)
+        if record['type'] != group_type:
+            return False
+        if record['type'] == 'result':
+            marker_key = self.get_key_for_task(record['id'], '.ref')
+        with self.client.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(key)
+                    if marker_key is not None:
+                        pipe.watch(marker_key)
+                    current = pipe.get(key)
+                    if current is None:
+                        pipe.unwatch()
+                        return False
+                    current_data = self.decode(current)
+                    if current_data.get('version') != record['data'].get('version'):
+                        pipe.unwatch()
+                        return False
+                    age, age_field = self._cleanup_record_age(
+                        {
+                            'date_created': current_data.get('date_created'),
+                            'date_updated': current_data.get('date_updated'),
+                            'date_done': current_data.get('date_done'),
+                        }, now)
+                    ttl = self._cleanup_record_ttl({
+                        'type': record['type'],
+                        'status': current_data.get('status', record['status']),
+                        'data': current_data,
+                    })
+                    if ttl is None or age is None or age < ttl:
+                        pipe.unwatch()
+                        return False
+                    marker_raw = pipe.get(marker_key) if marker_key is not None else None
+                    if marker_raw is not None:
+                        marker = self.decode(marker_raw)
+                        groups = {str(group) for group in marker.get('groups', ())}
+                        if not referenced or groups.intersection(str(value) for value in referenced):
+                            pipe.unwatch()
+                            return False
+                    pipe.multi()
+                    pipe.delete(key)
+                    pipe.execute()
+                    return True
+                except self.redis.WatchError:
+                    continue
+                finally:
+                    pipe.reset()
 
     def add_to_chord(self, group_id, result):
         self.client.incr(self.get_key_for_group(group_id, '.t'), 1)
@@ -594,6 +807,8 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
             header_result = self.app.GroupResult(*header_result_args)
             if any(isinstance(nr, GroupResult) for nr in header_result.results):
                 header_result.save(backend=self)
+        self._save_chord_body_reference(
+            self.app.GroupResult(*header_result_args), body)
 
     @cached_property
     def _chord_zset(self):
@@ -616,6 +831,7 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
         jkey = self.get_key_for_group(gid, '.j')
         tkey = self.get_key_for_group(gid, '.t')
         skey = self.get_key_for_group(gid, '.s')
+        pending_key = self.get_key_for_group(gid, '.pending')
         result = self.encode_result(result, state)
         encoded = self.encode([1, tid, state, result])
         with client.pipeline() as pipe:
@@ -624,11 +840,12 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
                 if self._chord_zset
                 else pipe.rpush(jkey, encoded).llen(jkey)
             ).get(tkey).get(skey)
-            if self.expires:
+            ttl = self.result_ttl_for(record_type='chord')
+            if ttl:
                 pipeline = pipeline \
-                    .expire(jkey, self.expires) \
-                    .expire(tkey, self.expires) \
-                    .expire(skey, self.expires)
+                    .expire(jkey, int(ttl)) \
+                    .expire(tkey, int(ttl)) \
+                    .expire(skey, int(ttl))
 
             _, readycount, totaldiff, chord_size_bytes = pipeline.execute()[:4]
 
@@ -682,12 +899,23 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
                             ChordError(f'Callback error: {exc!r}'),
                         )
                     finally:
+                        pending_raw = self.get(pending_key)
+                        reference_ids = []
+                        if pending_raw is not None:
+                            pending_payload = self.decode(pending_raw)
+                            reference_ids.append(tid)
+                            reference_ids.extend(pending_payload.get('task_ids', ()))
+                            if pending_payload.get('body_task_id'):
+                                reference_ids.append(pending_payload['body_task_id'])
                         with client.pipeline() as pipe:
                             pipe \
                                 .delete(jkey) \
                                 .delete(tkey) \
                                 .delete(skey) \
+                                .delete(pending_key) \
                                 .execute()
+                    for result_id in reference_ids:
+                        self._remove_result_reference(result_id, gid)
             except ChordError as exc:
                 logger.exception('Chord %r raised: %r', request.group, exc)
                 return self.chord_error_from_stack(callback, exc)

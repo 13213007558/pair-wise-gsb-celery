@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 import pytest
 from vine import promise
 
-from celery import chain, group
+from celery import chain, group, states
 from celery.backends.asynchronous import E_CELERY_RESTART_REQUIRED, BaseResultConsumer, greenletDrainer
 from celery.backends.base import Backend
 from celery.backends.rpc import RPCBackend
@@ -35,6 +35,47 @@ def _make_consumer(app, environment='default'):
 # ---------------------------------------------------------------------------
 
 class test_Drainer_without_greenlets:
+    def test_stale_async_poll_event_does_not_overwrite_newer_result(self, app):
+        consumer = _make_consumer(app)
+        result = app.AsyncResult('poll-task')
+        result._set_cache({
+            'task_id': result.id,
+            'status': states.SUCCESS,
+            'result': 'new',
+            'version': 2,
+        })
+        bucket = []
+        consumer.buckets[result] = bucket
+        consumer._pending_results = ({result.id: result}, {})
+        consumer.on_state_change({
+            'task_id': result.id,
+            'status': states.SUCCESS,
+            'result': 'stale',
+            'version': 1,
+        }, None)
+        assert bucket == []
+        assert result.result == 'new'
+
+    def test_newer_async_poll_event_fulfills_result(self, app):
+        consumer = _make_consumer(app)
+        result = app.AsyncResult('poll-task')
+        result._set_cache({
+            'task_id': result.id,
+            'status': states.RETRY,
+            'result': None,
+            'version': 1,
+        })
+        bucket = []
+        consumer.buckets[result] = bucket
+        consumer._pending_results = ({result.id: result}, {})
+        consumer.on_state_change({
+            'task_id': result.id,
+            'status': states.SUCCESS,
+            'result': 'new',
+            'version': 2,
+        }, None)
+        assert bucket == [result]
+        assert result.result == 'new'
 
     # -- drain_events_until: normal flow ------------------------------------
 

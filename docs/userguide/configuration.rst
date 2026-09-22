@@ -159,6 +159,8 @@ For a complete Django example, see :ref:`django-first-steps`.
 ``CELERY_RESULT_EXCHANGE``                 :setting:`result_exchange`
 ``CELERY_RESULT_EXCHANGE_TYPE``            :setting:`result_exchange_type`
 ``CELERY_RESULT_EXPIRES``                  :setting:`result_expires`
+``CELERY_RESULT_TTL``                      :setting:`result_ttl`
+``CELERY_RESULT_CLEANUP_BATCH_SIZE``       :setting:`result_cleanup_batch_size`
 ``CELERY_RESULT_PERSISTENT``               :setting:`result_persistent`
 ``CELERY_RESULT_SERIALIZER``               :setting:`result_serializer`
 ``CELERY_RESULT_DBURI``                    Use :setting:`result_backend` instead.
@@ -1032,6 +1034,51 @@ enabled. The task runs daily at 4am.
 
 A value of :const:`None` or 0 means results will never expire (depending
 on backend specifications).
+
+.. setting:: result_ttl
+
+``result_ttl``
+~~~~~~~~~~~~~
+
+Default: :const:`None` (use :setting:`result_expires` for every state/type).
+
+Configures retention independently for ``PENDING``, ``STARTED``, ``RETRY``,
+``SUCCESS``, ``FAILURE`` and ``REVOKED`` task results, as well as ``group``,
+``chord``, ``pending_reference`` and ``ignore_result`` records. Values are
+seconds or :class:`~datetime.timedelta`; :const:`None` or ``0`` disables
+expiry for that key. ``pending_reference`` covers group/chord body references
+and is kept at least as long as the corresponding group aggregate.
+
+Example::
+
+    result_ttl = {
+        'PENDING': 3600,
+        'STARTED': 3600,
+        'RETRY': 3600,
+        'SUCCESS': 86400,
+        'FAILURE': 7 * 86400,
+        'REVOKED': 7 * 86400,
+        'group': 14 * 86400,
+        'chord': 14 * 86400,
+        'pending_reference': 14 * 86400,
+        'ignore_result': 300,
+    }
+
+Safe cleanup requires a backend that can enumerate records and conditionally
+delete an unchanged version. Backends without those capabilities either return
+a degraded ``None`` cleanup result, or raise
+:exc:`~celery.exceptions.BackendCleanupError` when ``cleanup(strict=True)`` is
+used.
+
+.. setting:: result_cleanup_batch_size
+
+``result_cleanup_batch_size``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``500``.
+
+Maximum number of records inspected in one idempotent cleanup batch. The
+returned cursor can be passed to the next ``cleanup(cursor=...)`` call.
 
 .. note::
 

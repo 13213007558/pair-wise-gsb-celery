@@ -217,6 +217,8 @@ NAMESPACES = Namespace(
             timedelta(days=1),
             type='float', old={'celery_task_result_expires'},
         ),
+        ttl=Option(None, type='dict'),
+        cleanup_batch_size=Option(500, type='int'),
         persistent=Option(None, type='bool'),
         extended=Option(False, type='bool'),
         serializer=Option('json'),
