@@ -353,7 +353,10 @@ class Signature(dict):
 
             super().__init__(
                 task=task_name, args=tuple(args or ()),
-                kwargs=kwargs or {},
+                # copy the caller's kwargs mapping: canvas code merges and
+                # occasionally writes into .kwargs, and that must never
+                # leak back into a dictionary owned by the caller.
+                kwargs=dict(kwargs or {}),
                 options=dict(options or {}, **ex),
                 subtask_type=subtask_type,
                 immutable=immutable,
@@ -968,8 +971,9 @@ class _chain(Signature):
     def from_dict(cls, d, app=None):
         tasks = d['kwargs']['tasks']
         if tasks:
-            if isinstance(tasks, tuple):  # aaaargh
-                tasks = d['kwargs']['tasks'] = list(tasks)
+            # Do not write the canonicalized tasks back into d: it may be
+            # a dictionary owned by the caller, and mutating it would
+            # corrupt a reusable template.
             tasks = [maybe_signature(task, app=app) for task in tasks]
         return cls(tasks, app=app, **d['options'])
 
@@ -1098,10 +1102,23 @@ class _chain(Signature):
         args = (tuple(args) + tuple(self.args)
                 if args and not self.immutable else self.args)
 
+        # Prepare a throwaway copy of this chain so that the bookkeeping
+        # performed by prepare_steps() -- freezing task ids, recording the
+        # last task id on the chain itself, attaching links -- never lands
+        # on a potentially shared chain template.  Without this, a second
+        # apply_async() of the same chain object would find the previous
+        # run's task id in self.options and reuse it.  The tasks
+        # themselves are still cloned by prepare_steps() below; here we
+        # only need to protect the chain's own options, so a plain
+        # Signature.clone (which does not clone the tasks) is enough.
+        prepared_chain = Signature.clone(self)
+        prepared_chain._use_link = self._use_link
+
         # Unpack nested chains/groups/chords
-        tasks, results_from_prepare = self.prepare_steps(
-            args, kwargs, self.tasks, root_id, parent_id, link_error, app,
-            task_id, group_id, chord, group_index=group_index,
+        tasks, results_from_prepare = prepared_chain.prepare_steps(
+            args, kwargs, prepared_chain.tasks, root_id, parent_id,
+            link_error, app, task_id, group_id, chord,
+            group_index=group_index,
         )
 
         # For a chain of single task, execute the task directly and return the result for that task
@@ -1633,12 +1650,11 @@ class group(Signature):
 
         The tasks themselves can be dictionaries or signatures (or both).
         """
-        # We need to mutate the `kwargs` element in place to avoid confusing
-        # `freeze()` implementations which end up here and expect to be able to
-        # access elements from that dictionary later and refer to objects
-        # canonicalized here
+        # The tasks are canonicalized into a new sequence held by the
+        # group being constructed; the source dictionary is left untouched
+        # since it may be a reusable template owned by the caller.
         orig_tasks = d["kwargs"]["tasks"]
-        d["kwargs"]["tasks"] = rebuilt_tasks = type(orig_tasks)(
+        rebuilt_tasks = type(orig_tasks)(
             maybe_signature(task, app=app) for task in orig_tasks
         )
         return cls(rebuilt_tasks, app=app, **d['options'])
@@ -1691,7 +1707,10 @@ class group(Signature):
         if app.conf.task_always_eager:
             return self.apply(args, kwargs, **options)
         if not self.tasks:
-            return self.freeze()
+            # Freeze a throwaway clone: freezing records the group id in
+            # the signature's options, and doing so on a reusable template
+            # would make every later dispatch reuse the same group id.
+            return self.clone().freeze()
 
         options, group_id, root_id = self._freeze_gid(options)
         tasks = self._prepared(self.tasks, [], group_id, root_id, app)
@@ -1720,7 +1739,9 @@ class group(Signature):
         kwargs = kwargs if kwargs else {}
         app = self.app
         if not self.tasks:
-            return self.freeze()  # empty group returns GroupResult
+            # empty group returns GroupResult; freeze a clone so the
+            # template itself is not finalized (see apply_async above).
+            return self.clone().freeze()
         options, group_id, root_id = self._freeze_gid(options)
         tasks = self._prepared(self.tasks, [], group_id, root_id, app)
         return app.GroupResult(group_id, [
@@ -1746,10 +1767,9 @@ class group(Signature):
                 task = maybe_signature(task, app=self.app)
                 task.stamp(visitor, append_stamps, **headers)
                 new_tasks.append(task)
-            if isinstance(self.tasks, MutableSequence):
-                self.tasks[:] = new_tasks
-            else:
-                self.tasks = new_tasks
+            # Rebind rather than mutating in place so that a list object
+            # owned by the caller (group(user_list)) is never rewritten.
+            self.tasks = new_tasks
 
         if visitor is not None:
             visitor.on_group_end(self, **headers)
@@ -1952,10 +1972,11 @@ class group(Signature):
             results = list(self._freeze_unroll(
                 new_tasks, group_id, chord, root_id, parent_id,
             ))
-            if isinstance(self.tasks, MutableSequence):
-                self.tasks[:] = new_tasks
-            else:
-                self.tasks = new_tasks
+            # Rebind rather than mutating in place: self.tasks may be a
+            # list object owned by the caller (group(user_list)) or
+            # shared with a template (e.g. a cloned chord's header), and
+            # neither may be rewritten with frozen clones.
+            self.tasks = new_tasks
         return gid, results
 
     def freeze(self, _id=None, group_id=None, chord=None,
@@ -2245,7 +2266,10 @@ class _chord(Signature):
                 return self.apply(args, kwargs,
                                   body=body, task_id=task_id, **options)
 
-        merged_options = dict(self.options, **options) if options else self.options
+        # Never alias self.options here: the merged mapping is popped from
+        # below, and mutating it in place would corrupt a reusable chord
+        # template (and any signature sharing its options).
+        merged_options = dict(self.options, **options)
         option_task_id = merged_options.pop("task_id", None)
         if task_id is None:
             task_id = option_task_id
@@ -2327,7 +2351,10 @@ class _chord(Signature):
         app = app or self._get_app(body)
         group_id = header.options.get('task_id') or uuid()
         root_id = body.options.get('root_id')
-        options = dict(self.options, **options) if options else self.options
+        # Copy instead of aliasing self.options: this mapping is popped
+        # from below ('task_id'/'chain'/'chord') and merged into the body,
+        # so it must never be the template's own options dictionary.
+        options = dict(self.options, **options)
         if options:
             options.pop('task_id', None)
             body.options.update(options)

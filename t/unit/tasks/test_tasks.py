@@ -465,6 +465,27 @@ class test_task_retries(TasksCase):
         assert sig.options['exchange'] == 'testex'
         assert sig.options['routing_key'] == 'testrk'
 
+    def test_signature_from_request__keeps_root_lineage_not_kwargs_alias(self):
+        # A retry re-dispatches the same task id and must not alter the
+        # root lineage, and the retry signature must not alias the
+        # request's kwargs mapping (writing to it must not write back
+        # into the request).
+        self.retry_task.push_request()
+        self.retry_task.request.id = 'task-id'
+        self.retry_task.request.root_id = 'root-id'
+        self.retry_task.request.parent_id = 'parent-id'
+        self.retry_task.request.kwargs = {'tenant': 'a'}
+
+        sig = self.retry_task.signature_from_request()
+
+        assert sig.options['task_id'] == 'task-id'
+        assert sig.options['root_id'] == 'root-id'
+        assert sig.options['parent_id'] == 'parent-id'
+
+        sig.kwargs['tenant'] = 'b'
+        sig.kwargs['injected'] = True
+        assert self.retry_task.request.kwargs == {'tenant': 'a'}
+
     def test_signature_from_request__shadow_name(self):
         self.retry_task.push_request()
         self.retry_task.request.shadow = 'test'

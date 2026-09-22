@@ -233,6 +233,49 @@ so it's not possible to call the signature with partial args/kwargs.
         >>> sig.apply_async().get()
 
 
+.. _canvas-reusable-templates:
+
+Reusable templates
+------------------
+
+Signatures and whole canvases can be kept as *templates* and dispatched
+repeatedly -- for example one chain definition shared by many tenants.
+Dispatching never mutates the template: every `apply_async` (and
+`apply`) freezes *clones* of the template's tasks, so each run
+gets independent task ids, parent ids and group ids, and the template
+stays byte-identical:
+
+.. code-block:: pycon
+
+    >>> template = chain(charge.s(amount=10), notify.si('ops-team'))
+    >>> res_a = template.apply_async(kwargs={'tenant_id': 'tenant-a'})
+    >>> res_b = template.apply_async(kwargs={'tenant_id': 'tenant-b'})
+    >>> res_a.id != res_b.id
+    True
+    >>> 'task_id' in template.options  # nothing leaked into the template
+    False
+
+The inheritance boundary works as follows:
+
+* dispatch-time args/kwargs are merged into the *clones* of mutable
+  members only; immutable members keep their own args/kwargs and are
+  never injected with the parent task's result;
+* trace headers -- root id, parent id, group id and stamps -- are still
+  inherited by the dispatched clones, immutable or not;
+* `clone`/`partial` derive independent copies: mutating a clone
+  never writes back into the template;
+* `freeze` is the explicitly *finalizing* operation: it assigns a
+  concrete task id to the signature it is called on, so freeze a
+  `clone()` when the template must stay reusable;
+* dictionaries and lists passed by the caller (kwargs, task lists,
+  serialized dicts) are never written back to by canvas preparation.
+
+Retries re-dispatch the same task id and preserve the root lineage
+(`root_id`/`parent_id` and stamped headers) of the original message.
+
+See `examples/canvas/reusable_templates.py` for a runnable version of
+these scenarios.
+
 .. _canvas-callbacks:
 
 Callbacks

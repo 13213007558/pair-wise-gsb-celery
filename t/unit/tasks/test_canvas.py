@@ -1,6 +1,8 @@
+import copy
 import json
 import math
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import ANY, MagicMock, Mock, call, patch, sentinel
 
 import pytest
@@ -2741,3 +2743,242 @@ class test_merge_dictionaries(CanvasCase):
         d2 = {'level1': {'level2': {'level3': {'shared': 2}}}}
         _merge_dictionaries(d1, d2, aggregate_duplicates=aggregate_duplicates)
         assert d1 == {'level1': {'level2': {'level3': {'shared': expected_value}}}}
+
+
+def _snapshot(sig):
+    """Deep-copied dict form of a signature, for mutation comparisons."""
+    return copy.deepcopy(dict(sig))
+
+
+class test_reusable_templates(CanvasCase):
+    """A signature used as a reusable template must never be mutated by
+    dispatch, cloning, freezing of *other* objects, or (de)serialization.
+
+    Each apply_async() of the same template must produce independent
+    task/group ids, and dictionaries/lists owned by the caller must never
+    be written back to.
+    """
+
+    def test_chain_template_not_mutated_by_apply_async(self):
+        t1, t2 = self.add.s(1, 2), self.add.s(3)
+        t1_before, t2_before = _snapshot(t1), _snapshot(t2)
+        c = chain(t1, t2)
+        c_before = _snapshot(c)
+
+        r1 = c.apply_async()
+        r2 = c.apply_async()
+
+        # every dispatch gets its own task id for the last task
+        assert r1.id != r2.id
+        # the chain template and its members are byte-identical
+        assert _snapshot(c) == c_before
+        assert _snapshot(t1) == t1_before
+        assert _snapshot(t2) == t2_before
+        assert 'task_id' not in c.options
+
+    def test_chain_template_concurrent_dispatch(self):
+        c = chain(self.add.s(1, 2), self.add.s(3), self.add.s(4))
+        c_before = _snapshot(c)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: c.apply_async(), range(32)))
+
+        # all dispatches produced independent task ids
+        ids = [r.id for r in results]
+        assert len(set(ids)) == len(ids)
+        assert _snapshot(c) == c_before
+
+    def test_group_template_not_mutated_by_apply_async(self):
+        members = [self.add.s(1, 1), self.add.s(2, 2)]
+        members_before = [_snapshot(m) for m in members]
+        g = group(members)
+        g_before = _snapshot(g)
+
+        r1 = g.apply_async()
+        r2 = g.apply_async()
+
+        assert r1.id != r2.id
+        assert _snapshot(g) == g_before
+        assert [_snapshot(m) for m in members] == members_before
+
+    def test_empty_group_template_not_mutated_by_apply_async(self):
+        g = group([], app=self.app)
+        g_before = _snapshot(g)
+
+        r1 = g.apply_async()
+        r2 = g.apply_async()
+
+        assert r1.id != r2.id
+        assert _snapshot(g) == g_before
+
+    def test_chord_template_not_mutated_by_apply_async(self):
+        body = self.add.s(10)
+        body_before = _snapshot(body)
+        c = chord([self.add.s(1, 1), self.add.s(2, 2)], body)
+        c_before = _snapshot(c)
+
+        r1 = c.apply_async()
+        r2 = c.apply_async()
+
+        # every dispatch gets its own body task id
+        assert r1.id != r2.id
+        # the chord template (options, header tasks, body) is unchanged
+        assert _snapshot(c) == c_before
+        assert _snapshot(body) == body_before
+
+    def test_deep_nested_template_not_mutated_by_apply_async(self):
+        inner_chain = chain(self.add.s(1, 1), self.add.s(2))
+        nested = chain(
+            self.add.s(0, 0),
+            group(self.add.s(3, 3), inner_chain),
+            chord([self.add.s(4, 4), self.add.s(5, 5)], self.add.s(6)),
+        )
+        nested_before = _snapshot(nested)
+        inner_before = _snapshot(inner_chain)
+
+        r1 = nested.apply_async()
+        r2 = nested.apply_async()
+
+        assert r1.id != r2.id
+        assert _snapshot(nested) == nested_before
+        assert _snapshot(inner_chain) == inner_before
+
+    def test_clone_does_not_mutate_template(self):
+        s = self.add.s(2, 2)
+        s_before = _snapshot(s)
+
+        clone = s.clone((4,), {'extra': 1}, priority=5)
+
+        assert _snapshot(s) == s_before
+        # the clone owns its kwargs/options: writing to them must not
+        # leak back into the template
+        clone.kwargs['other'] = 2
+        clone.options['priority'] = 9
+        assert 'other' not in s.kwargs
+        assert s.options.get('priority') != 9
+
+    def test_signature_does_not_alias_caller_kwargs(self):
+        user_kwargs = {'tenant': 'a'}
+        s = Signature(self.add.name, args=(1,), kwargs=user_kwargs,
+                      app=self.app)
+        s.kwargs['tenant'] = 'b'
+        s.kwargs['injected'] = True
+        assert user_kwargs == {'tenant': 'a'}
+
+    def test_chain_from_dict_does_not_mutate_user_dict(self):
+        d = {
+            'task': 'celery.chain',
+            'args': (),
+            'kwargs': {'tasks': (
+                dict(self.add.s(1, 2)),
+                dict(self.add.s(3)),
+            )},
+            'options': {},
+            'subtask_type': 'chain',
+            'immutable': False,
+        }
+        d_before = copy.deepcopy(d)
+        c = signature(d)
+        assert isinstance(c, _chain)
+        # the caller's dict keeps its original shape: tasks stay dicts
+        # inside a tuple, nothing is canonicalized in place
+        assert d == d_before
+
+    def test_group_from_dict_does_not_mutate_user_dict(self):
+        d = {
+            'task': 'celery.group',
+            'args': (),
+            'kwargs': {'tasks': [
+                dict(self.add.s(1, 2)),
+                dict(self.add.s(3, 4)),
+            ]},
+            'options': {},
+            'subtask_type': 'group',
+            'immutable': False,
+        }
+        d_before = copy.deepcopy(d)
+        g = signature(d)
+        assert isinstance(g, group)
+        assert d == d_before
+        # the tasks in the caller's dict are still plain dicts
+        assert all(type(t) is dict for t in d['kwargs']['tasks'])
+
+    def test_group_freeze_does_not_rewrite_caller_list(self):
+        t1, t2 = self.add.s(1, 1), self.add.s(2, 2)
+        user_list = [t1, t2]
+        g = group(user_list)
+
+        g.freeze()
+
+        # the caller's list still holds the original, unfrozen signatures
+        assert list(user_list) == [t1, t2]
+        assert user_list[0] is t1
+        assert user_list[1] is t2
+        assert t1.options == {}
+        assert t2.options == {}
+
+    def test_chord_apply_async_does_not_rewrite_header(self):
+        c = chord([self.add.s(1, 1), self.add.s(2, 2)], self.add.s(10))
+        header_before = [_snapshot(t) for t in c.tasks]
+
+        c.apply_async()
+
+        assert [_snapshot(t) for t in c.tasks] == header_before
+
+    def test_immutable_member_not_injected_but_headers_inherited(self):
+        imm = self.add.si(5)
+        c = _chain(self.add.s(1, 1), imm, app=self.app)
+
+        tasks, _ = c.prepare_steps((9,), {}, c.tasks, root_id='root')
+
+        # tasks[-1] is the first task of the chain (reverse order):
+        # it received the partial args...
+        assert tasks[-1].args == (9, 1, 1)
+        # ...but the clone of the immutable member was not injected
+        assert tasks[0].args == (5,)
+        # while trace headers (root_id) are still inherited by the clones
+        assert all(t.options.get('root_id') == 'root' for t in tasks)
+        # and the template member itself is untouched
+        assert imm.args == (5,)
+        assert 'root_id' not in imm.options
+
+    def test_prepare_steps_does_not_mutate_member_templates(self):
+        t1, t2 = self.add.s(1, 1), self.add.s(2)
+        link = self.add.s(99)
+        c = _chain(t1, t2, app=self.app)
+
+        c.prepare_steps((7,), {}, c.tasks, root_id='root',
+                        link_error=[link])
+
+        # partial args, root_id and errbacks land on the prepared clones,
+        # never on the template members
+        assert t1.args == (1, 1)
+        assert t2.args == (2,)
+        assert t1.options == {}
+        assert t2.options == {}
+
+    def test_serialized_template_dispatch_round_trip(self):
+        c = chain(self.add.s(1, 2), group(self.add.s(3, 3), self.add.s(4)),
+                  self.add.s(5))
+        serialized = json.loads(json.dumps(dict(c)))
+        serialized_before = copy.deepcopy(serialized)
+
+        revived = signature(serialized, app=self.app)
+        r1 = revived.apply_async()
+        r2 = revived.apply_async()
+
+        assert r1.id != r2.id
+        # the serialized form (e.g. a stored template) is not written back
+        assert serialized == serialized_before
+
+    def test_pickle_round_trip_template_reusable(self):
+        import pickle
+        c = chain(self.add.s(1, 2), self.add.s(3))
+        revived = pickle.loads(pickle.dumps(c))
+        revived._app = self.app
+
+        r1 = revived.apply_async()
+        r2 = revived.apply_async()
+
+        assert r1.id != r2.id
+        assert 'task_id' not in revived.options
