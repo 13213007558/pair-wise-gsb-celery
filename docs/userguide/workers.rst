@@ -111,6 +111,44 @@ The worker will initiate the shutdown process when it receives the :sig:`TERM` o
 The :sig:`INT` (Ctrl-C) signal is also handled during the shutdown process and always triggers the
 next stage of the shutdown process.
 
+.. _worker-shutdown-phases:
+
+Shutdown Phases
+~~~~~~~~~~~~~~~
+
+Independently of how the shutdown was initiated (warm, soft, cold, hard,
+repeated signals, connection loss, or an embedded worker), the worker, its
+consumer and the execution pool all drive the same ordered sequence of
+phases, tracked by :class:`celery.worker.shutdown.ShutdownState`:
+
+#. ``DRAIN`` -- the worker stops receiving new tasks: the task consumer is
+   cancelled and no further messages are accepted from the broker.
+#. ``CANCEL`` -- already-received tasks are cancelled or revoked according
+   to pool capability.  Queued (reserved/scheduled) tasks are dropped so
+   the broker can redeliver them; executing tasks that cannot finish are
+   cancelled.  Every :signal:`task_revoked` signal emitted here belongs to
+   exactly one task, and the phase the task was in is recorded on
+   ``request.shutdown_phase`` (``'scheduled'``, ``'reserved'`` or
+   ``'active'``).
+#. ``WAIT_POOL`` -- warm shutdown only: the pool is drained.  Late
+   acknowledgments, soft time limits, ``task_postrun`` and task signals
+   all complete in this window, while the broker connection and the
+   result backend are still open.
+#. ``TERMINATE`` -- cold shutdown: remaining pool jobs are terminated
+   (after the soft shutdown timeout, when enabled).
+#. ``CLOSE_RESOURCES`` -- the result backend and the broker connection
+   are closed.  This phase is never entered before the pool has drained
+   (warm) or been terminated (cold), so in-flight acknowledgments and
+   results are not lost.
+#. ``CLOSED`` -- terminal state.
+
+Each phase transition is idempotent and recorded in
+``worker.shutdown.history``, so repeated shutdown signals, a worker
+crash, abnormal child process exits, or autoscale activity during
+shutdown can neither repeat side effects (such as emitting
+:signal:`task_revoked` twice for the same task) nor wedge the main
+process.
+
 .. _worker-warm-shutdown:
 
 Warm Shutdown

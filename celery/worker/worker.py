@@ -34,6 +34,7 @@ from celery.utils.text import str_to_list
 from celery.utils.threads import bound_open_broker_sockets, default_socket_timeout
 
 from . import state
+from .shutdown import ShutdownPhase, ShutdownState
 
 try:
     import resource
@@ -73,6 +74,9 @@ class WorkController:
     #: contains the exit code if a :exc:`SystemExit` event is handled.
     exitcode = None
 
+    #: set once the worker_shutdown signal has been sent.
+    _worker_shutdown_sent = False
+
     class Blueprint(bootsteps.Blueprint):
         """Worker bootstep blueprint."""
 
@@ -91,6 +95,9 @@ class WorkController:
         self.app = app or self.app
         self.hostname = default_nodename(hostname)
         self.startup_time = datetime.now(timezone.utc)
+        #: Unified drain/cancel/terminate phase tracker shared with the
+        #: consumer, pool and blueprint during shutdown.
+        self.shutdown = ShutdownState()
         self.app.loader.init_worker()
         self.on_before_init(**kwargs)
         self.setup_defaults(**kwargs)
@@ -196,6 +203,11 @@ class WorkController:
         return kwargs
 
     def _send_worker_shutdown(self):
+        if self._worker_shutdown_sent:
+            # Repeated shutdown (duplicate signals, stop after
+            # terminate) must not re-emit the signal.
+            return
+        self._worker_shutdown_sent = True
         signals.worker_shutdown.send(sender=self)
 
     def start(self):
@@ -243,7 +255,9 @@ class WorkController:
 
     def stop(self, in_sighandler=False, exitcode=None):
         """Graceful shutdown of the worker server (Warm shutdown)."""
-        if exitcode is not None:
+        if exitcode is not None and self.exitcode is None:
+            # First exitcode wins: repeated shutdown signals must not
+            # change the already-decided exit status.
             self.exitcode = exitcode
         if self.blueprint.state == RUN:
             self.signal_consumer_close()
@@ -269,6 +283,10 @@ class WorkController:
         # if blueprint does not exist it means that we had an
         # error before the bootsteps could be initialized.
         if self.blueprint is not None:
+            # Stopping the task consumer (DRAIN) happens inside
+            # blueprint.stop(); record it here so every shutdown path
+            # (warm, cold, embedded) drives the same phase sequence.
+            self.shutdown.enter(ShutdownPhase.DRAIN)
             # Not bounding the broker socket here: a warm shutdown still has
             # acks to flush, and capping those writes on a slow broker would
             # lose acks and redeliver tasks.  A silent broker can still wedge
@@ -278,6 +296,11 @@ class WorkController:
             with default_socket_timeout(SHUTDOWN_SOCKET_TIMEOUT):  # Issue 975
                 self.blueprint.stop(self, terminate=not warm)
                 self.blueprint.join()
+            # The pool has drained (warm) or been terminated (cold) at
+            # this point; only now may resources be released.
+            self.shutdown.enter(ShutdownPhase.CLOSE_RESOURCES)
+            self.shutdown.enter(ShutdownPhase.CLOSED)
+            logger.info('shutdown complete: %s', self.shutdown.describe())
 
     def reload(self, modules=None, reload=False, reloader=None):
         list(self._reload_modules(

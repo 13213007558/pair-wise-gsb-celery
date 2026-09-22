@@ -33,6 +33,7 @@ from celery.utils.text import truncate
 from celery.utils.threads import bound_open_broker_sockets
 from celery.utils.time import humanize_seconds, rate
 from celery.worker import loops
+from celery.worker.shutdown import ShutdownPhase
 from celery.worker.state import (active_requests, maybe_shutdown, requests, reserved_requests, scheduled_requests,
                                  successful_requests, task_reserved)
 
@@ -853,6 +854,10 @@ class Consumer:
         Does not cancel successful tasks, even if they have not been acknowledged yet.
         """
 
+        shutdown = getattr(self.controller, 'shutdown', None)
+        if shutdown is not None:
+            shutdown.enter(ShutdownPhase.CANCEL)
+
         def should_cancel(request):
             if not request.task.acks_late:
                 # Task does not require late acknowledgment, cancel it.
@@ -871,6 +876,12 @@ class Consumer:
         requests_to_cancel = tuple(filter(should_cancel, active_requests))
 
         if requests_to_cancel:
+            info(
+                'shutdown: cancelling %d active request(s) '
+                '(reserved=%d scheduled=%d)',
+                len(requests_to_cancel),
+                len(reserved_requests), len(scheduled_requests),
+            )
             for request in requests_to_cancel:
                 # For acks_late tasks, don't emit RETRY signal since broker will handle redelivery
                 # For non-acks_late tasks, emit RETRY signal as usual

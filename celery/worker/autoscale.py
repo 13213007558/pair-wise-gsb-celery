@@ -81,6 +81,11 @@ class Autoscaler(bgThread):
         sleep(1.0)
 
     def _maybe_scale(self, req=None):
+        if self.pool._state in (self.pool.CLOSE, self.pool.TERMINATE):
+            # The pool is draining/terminating: scaling now could grow
+            # a closing pool or block the main thread on pool locks
+            # during shutdown.
+            return False
         procs = self.processes
         cur = min(self.qty, self.max_concurrency)
         if cur > procs:

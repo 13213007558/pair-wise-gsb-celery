@@ -748,6 +748,97 @@ class test_Request(RequestCase):
         job.task.on_retry.assert_not_called()
         assert job._already_cancelled is True
 
+    def test_terminate__idempotent(self):
+        # repeated shutdown must not signal the (possibly reused) pid twice
+        pool = Mock()
+        signum = signal.SIGTERM
+        job = self.get_request(self.mytask.s(1, f='x'))
+        job.time_start = monotonic()
+        job.worker_pid = 313
+        job.terminate(pool, signal='TERM')
+        job.terminate(pool, signal='TERM')
+        pool.terminate_job.assert_called_once_with(313, signum)
+
+    def test_cancel__idempotent(self):
+        # cold shutdown handler and soft-shutdown escalation both end up
+        # here; the request must only be cancelled once.
+        pool = Mock()
+        signum = signal.SIGTERM
+        job = self.get_request(self.mytask.s(1, f='x'))
+        job.time_start = monotonic()
+        job.worker_pid = 314
+        job.cancel(pool, signal='TERM')
+        job.cancel(pool, signal='TERM')
+        pool.terminate_job.assert_called_once_with(314, signum)
+
+    def test_announce_revoked__sends_task_revoked_once(self):
+        job = self.get_request(self.mytask.s(1, f='x'))
+        job.time_start = monotonic()
+        job.worker_pid = 313
+        calls = []
+
+        def on_revoked(**kwargs):
+            calls.append(kwargs)
+
+        task_revoked.connect(on_revoked)
+        try:
+            job.terminate(Mock(), signal='TERM')
+            job._announce_revoked('revoked', False, None, False)
+        finally:
+            task_revoked.disconnect(on_revoked)
+        assert len(calls) == 1
+
+    def test_lifecycle_phase(self):
+        from celery.worker import state as worker_state
+        job = self.get_request(self.mytask.s(1, f='x'))
+        assert job.lifecycle_phase is None
+        worker_state.scheduled_requests.add(job)
+        try:
+            assert job.lifecycle_phase == 'scheduled'
+        finally:
+            worker_state.scheduled_requests.discard(job)
+        worker_state.reserved_requests.add(job)
+        try:
+            assert job.lifecycle_phase == 'reserved'
+            # executing wins over queued when a request is in both sets
+            worker_state.active_requests.add(job)
+            try:
+                assert job.lifecycle_phase == 'active'
+            finally:
+                worker_state.active_requests.discard(job)
+        finally:
+            worker_state.reserved_requests.discard(job)
+
+    def test_shutdown_phase__attributed_to_unique_phase(self):
+        from celery.worker import state as worker_state
+        job = self.get_request(self.mytask.s(1, f='x'))
+        worker_state.reserved_requests.add(job)
+        try:
+            job._announce_revoked('revoked', False, None, False)
+            assert job.shutdown_phase == 'reserved'
+            # a repeated revoke keeps the original phase and does not
+            # re-announce.
+            worker_state.active_requests.add(job)
+            try:
+                job._announce_revoked('revoked', False, None, False)
+                assert job.shutdown_phase == 'reserved'
+            finally:
+                worker_state.active_requests.discard(job)
+        finally:
+            worker_state.reserved_requests.discard(job)
+
+    def test_shutdown_phase__active_on_cancel(self):
+        from celery.worker import state as worker_state
+        job = self.get_request(self.mytask.s(1, f='x'))
+        job.time_start = monotonic()
+        job.worker_pid = 314
+        worker_state.active_requests.add(job)
+        try:
+            job.cancel(Mock(), signal='TERM')
+            assert job.shutdown_phase == 'active'
+        finally:
+            worker_state.active_requests.discard(job)
+
     def test_revoked_expires_expired(self):
         job = self.get_request(self.mytask.s(1, f='x').set(
             expires=datetime.now(timezone.utc) - timedelta(days=1)

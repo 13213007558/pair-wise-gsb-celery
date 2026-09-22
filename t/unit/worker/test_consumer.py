@@ -787,6 +787,51 @@ class test_Consumer(ConsumerTestCase):
             active_requests.clear()
             successful_requests.clear()
 
+    @pytest.mark.usefixtures('depends_on_current_app')
+    def test_cancel_active_requests__records_cancel_phase_once(self):
+        from celery.worker.shutdown import ShutdownPhase, ShutdownState
+        c = self.get_consumer()
+        c.controller.shutdown = ShutdownState()
+
+        c.cancel_active_requests()
+        c.cancel_active_requests()
+
+        assert c.controller.shutdown.is_at_least(ShutdownPhase.CANCEL)
+        assert [p for p, _ in c.controller.shutdown.history] == [
+            ShutdownPhase.CANCEL]
+
+    @pytest.mark.usefixtures('depends_on_current_app')
+    def test_cancel_active_requests__idempotent(self):
+        # repeated shutdown paths (cold handler, soft-shutdown
+        # escalation) all call this; each request must only be
+        # cancelled once.
+        from time import monotonic
+
+        from kombu.utils.uuid import uuid
+
+        from celery.worker.request import Request
+        c = self.get_consumer()
+
+        message = Mock(name='message')
+        message.headers = {'id': uuid(), 'task': 'celery.ping'}
+        message.body = None
+        message.content_type = message.content_encoding = None
+        message.properties = {}
+        message.delivery_info = {}
+        request = Request(
+            message, app=self.app, body=([], {}, {}), decoded=True,
+        )
+        request.time_start = monotonic()
+        request.worker_pid = 123
+        active_requests.add(request)
+        try:
+            c.cancel_active_requests()
+            c.cancel_active_requests()
+            c.pool.terminate_job.assert_called_once()
+            assert request.shutdown_phase == 'active'
+        finally:
+            active_requests.discard(request)
+
     def test_ensure_connected_uses_legacy_retry_when_startup_retry_is_undefined(self):
         c = self.get_consumer()
         c.first_connection_attempt = True

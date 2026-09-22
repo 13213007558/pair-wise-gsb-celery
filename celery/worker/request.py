@@ -73,9 +73,19 @@ class Request:
     time_limits = (None, None)
     _already_revoked = False
     _already_cancelled = False
+    _terminate_requested = False
     _terminate_on_ack = None
     _apply_result = None
     _tzlocal = None
+
+    #: The lifecycle phase this request was in when it was
+    #: revoked/cancelled during worker shutdown: one of 'scheduled',
+    #: 'reserved' or 'active'.  Set exactly once -- the first
+    #: revoke/cancel wins -- so every emitted task_revoked signal can be
+    #: correlated with the unique phase the task was in.  None when
+    #: the request was not revoked (or its phase could not be
+    #: determined).
+    shutdown_phase = None
 
     #: Timer entry for this request's pending ETA/countdown callback, set by
     #: :mod:`celery.worker.strategy` when the request is scheduled so that
@@ -419,9 +429,38 @@ class Request:
                 revoked_tasks.add(self.id)
                 return True
 
+    @property
+    def lifecycle_phase(self):
+        """Current lifecycle phase of this request.
+
+        One of:
+
+        * "scheduled" -- waiting for its ETA/countdown to fire,
+        * "reserved" -- received from the broker, queued for a pool slot,
+        * "active" -- executing in the pool right now,
+        * None -- none of the above (e.g. already finalized).
+
+        Used to attribute every emitted task_revoked/task-cancelled
+        signal to the unique phase the task was in when the shutdown
+        (or revoke) happened.
+        """
+        if self in state.active_requests:
+            return 'active'
+        if self in state.reserved_requests:
+            return 'reserved'
+        if self in state.scheduled_requests:
+            return 'scheduled'
+        return None
+
     def terminate(self, pool, signal=None):
         signal = _signals.signum(signal or TERM_SIGNAME)
         if self.time_start:
+            if self._terminate_requested or self._already_cancelled:
+                # Already terminating/cancelled: a repeated shutdown
+                # must not signal the (possibly reused) pid again, and
+                # the first terminal signal (revoked/cancelled) wins.
+                return
+            self._terminate_requested = True
             pool.terminate_job(self.worker_pid, signal)
             self._announce_revoked('terminated', True, signal, False)
         else:
@@ -433,6 +472,11 @@ class Request:
 
     def cancel(self, pool, signal=None, emit_retry=True):
         signal = _signals.signum(signal or TERM_SIGNAME)
+        if self._already_cancelled or self._terminate_requested:
+            # Idempotent: repeated shutdown paths (cold shutdown handler,
+            # soft-shutdown escalation, connection loss) all end up here,
+            # but the request must only be cancelled once.
+            return
         if self.time_start:
             pool.terminate_job(self.worker_pid, signal)
             self._announce_cancelled(emit_retry=emit_retry)
@@ -443,6 +487,10 @@ class Request:
                 obj.terminate(signal)
 
     def _announce_cancelled(self, emit_retry=True):
+        if self._already_cancelled:
+            return
+        if self.shutdown_phase is None:
+            self.shutdown_phase = self.lifecycle_phase
         task_ready(self)
         self.send_event('task-cancelled')
 
@@ -461,6 +509,13 @@ class Request:
             send_retry(self.task, request=self._context, einfo=None)
 
     def _announce_revoked(self, reason, terminated, signum, expired):
+        if self._already_revoked:
+            # The task_revoked signal was already emitted for this
+            # request; a repeated revoke (e.g. duplicate shutdown) must
+            # not send it again.
+            return
+        if self.shutdown_phase is None:
+            self.shutdown_phase = self.lifecycle_phase
         task_ready(self)
         self.send_event('task-revoked',
                         terminated=terminated, signum=signum, expired=expired)

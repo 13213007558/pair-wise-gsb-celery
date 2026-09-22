@@ -5,6 +5,7 @@ import pytest
 import t.skip
 from celery.exceptions import ImproperlyConfigured
 from celery.worker.components import Beat, Hub, Pool, Timer
+from celery.worker.shutdown import ShutdownPhase
 
 # some of these are tested in test_worker, so I've only written tests
 # here to complete coverage.  Should move everything to this module at some
@@ -47,6 +48,25 @@ class test_Hub:
 
 
 class test_Pool:
+
+    def test_stop_drains_pool_and_records_phase(self):
+        w = Mock()
+        comp = Pool(w)
+        pool = w.pool = Mock()
+        comp.stop(w)
+        pool.stop.assert_called_with()
+        w.shutdown.enter.assert_called_with(ShutdownPhase.WAIT_POOL)
+
+        w.pool = None
+        comp.stop(w)
+
+    def test_terminate_records_phase(self):
+        w = Mock()
+        comp = Pool(w)
+        pool = w.pool = Mock()
+        comp.terminate(w)
+        pool.terminate.assert_called_with()
+        w.shutdown.enter.assert_called_with(ShutdownPhase.TERMINATE)
 
     def test_close_terminate(self):
         w = Mock()

@@ -12,6 +12,7 @@ from celery._state import _set_task_join_will_block
 from celery.exceptions import ImproperlyConfigured
 from celery.platforms import IS_WINDOWS
 from celery.utils.log import worker_logger as logger
+from celery.worker.shutdown import ShutdownPhase
 
 __all__ = ('Timer', 'Hub', 'Pool', 'Beat', 'StateDB', 'Consumer')
 
@@ -131,7 +132,21 @@ class Pool(bootsteps.StartStopStep):
         if w.pool:
             w.pool.close()
 
+    def stop(self, w):
+        # Warm shutdown drains the pool here: stop accepting new jobs
+        # and wait for executing tasks to finish (late acks, soft time
+        # limits, task_postrun and task signals all complete in this
+        # window) before the blueprint moves on to closing resources.
+        shutdown = getattr(w, 'shutdown', None)
+        if shutdown is not None:
+            shutdown.enter(ShutdownPhase.WAIT_POOL)
+        if w.pool:
+            w.pool.stop()
+
     def terminate(self, w):
+        shutdown = getattr(w, 'shutdown', None)
+        if shutdown is not None:
+            shutdown.enter(ShutdownPhase.TERMINATE)
         if w.pool:
             w.pool.terminate()
 

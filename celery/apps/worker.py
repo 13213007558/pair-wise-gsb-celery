@@ -30,6 +30,7 @@ from celery.utils.text import pluralize
 from celery.utils.threads import bound_open_broker_sockets
 from celery.utils.time import humanize_seconds
 from celery.worker import WorkController
+from celery.worker.shutdown import ShutdownPhase
 from celery.worker.worker import SHUTDOWN_SOCKET_TIMEOUT
 
 __all__ = ('Worker',)
@@ -459,6 +460,12 @@ def on_cold_shutdown(worker: Worker):
     # A bounded socket makes cancel() raise on a silent peer; that must not abort the shutdown.
     if worker.consumer.task_consumer:
         ignore_errors(worker.consumer, worker.consumer.task_consumer.cancel)
+
+    # Record that new tasks are no longer accepted before cancelling
+    # the active ones, so the phase history reflects the real order.
+    shutdown = getattr(worker, 'shutdown', None)
+    if shutdown is not None:
+        shutdown.enter(ShutdownPhase.DRAIN)
 
     # Cancel all unacked requests and allow the worker to terminate naturally
     worker.consumer.cancel_active_requests()

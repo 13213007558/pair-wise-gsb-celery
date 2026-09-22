@@ -63,6 +63,7 @@ class BasePool:
     _state = None
     _pool = None
     _does_debug = True
+    _terminated = False
 
     #: only used by multiprocessing pool
     uses_semaphore = False
@@ -118,10 +119,20 @@ class BasePool:
             f'{type(self)} does not implement restart')
 
     def stop(self):
+        # Idempotent: a second stop (e.g. repeated shutdown signal, or
+        # a cold shutdown escalating after a warm one already drained
+        # the pool) must not re-run on_stop().
+        if self._state == self.TERMINATE:
+            return
         self.on_stop()
         self._state = self.TERMINATE
 
     def terminate(self):
+        # Idempotent, but independent of stop(): a cold shutdown after
+        # a warm stop() must still run on_terminate() once.
+        if self._terminated:
+            return
+        self._terminated = True
         self._state = self.TERMINATE
         self.on_terminate()
 
@@ -129,8 +140,13 @@ class BasePool:
         self._does_debug = logger.isEnabledFor(logging.DEBUG)
         self.on_start()
         self._state = self.RUN
+        self._terminated = False
 
     def close(self):
+        # Idempotent and monotonic: never regress from TERMINATE back
+        # to CLOSE, and never close twice.
+        if self._state in (self.CLOSE, self.TERMINATE):
+            return
         self._state = self.CLOSE
         self.on_close()
 
@@ -174,6 +190,16 @@ class BasePool:
     @property
     def active(self):
         return self._state == self.RUN
+
+    @property
+    def state_name(self):
+        """Human-readable name of the current pool state."""
+        return {
+            None: 'initializing',
+            self.RUN: 'running',
+            self.CLOSE: 'closing',
+            self.TERMINATE: 'terminating',
+        }[self._state]
 
     @property
     def num_processes(self):

@@ -76,6 +76,18 @@ class test_Autoscaler:
     def setup_method(self):
         self.pool = MockPool(3)
 
+    def test_maybe_scale__pool_draining(self):
+        # autoscale must not grow/shrink a pool that is closing or
+        # terminating, or shutdown could block on pool locks.
+        worker = Mock(name='worker')
+        x = autoscale.Autoscaler(self.pool, 10, 3, worker=worker)
+        self.pool._state = self.pool.CLOSE
+        assert not x._maybe_scale()
+        self.pool._state = self.pool.TERMINATE
+        assert not x._maybe_scale()
+        self.pool._state = self.pool.RUN
+        assert x.processes == 3
+
     def test_stop(self):
 
         class Scaler(autoscale.Autoscaler):

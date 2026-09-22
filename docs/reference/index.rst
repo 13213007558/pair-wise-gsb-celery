@@ -56,8 +56,9 @@
     celery.apps.beat
     celery.apps.multi
     celery.worker
-    celery.worker.request
-    celery.worker.state
+   celery.worker.request
+    celery.worker.shutdown
+   celery.worker.state
     celery.worker.strategy
     celery.worker.consumer
     celery.worker.consumer.agent

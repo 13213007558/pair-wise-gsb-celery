@@ -33,6 +33,7 @@ from celery.worker import worker as worker_module
 from celery.worker.consumer import Consumer
 from celery.worker.pidbox import gPidbox
 from celery.worker.request import Request
+from celery.worker.shutdown import ShutdownPhase
 from t.unit.conftest import restore_execv_state
 
 
@@ -800,6 +801,37 @@ class test_WorkController(ConsumerCase):
     def test_shutdown_no_blueprint(self):
         self.worker.blueprint = None
         self.worker._shutdown()
+
+    def test_repeated_stop_sends_worker_shutdown_once(self):
+        worker = self.worker
+        worker.blueprint = Mock(name='blueprint')
+        worker.blueprint.state = RUN
+        with patch('celery.signals.worker_shutdown') as ws:
+            worker.stop()
+            worker.stop()
+            ws.send.assert_called_once_with(sender=worker)
+
+    def test_repeated_stop_keeps_first_exitcode(self):
+        worker = self.worker
+        worker.blueprint = Mock(name='blueprint')
+        worker.blueprint.state = RUN
+        worker.stop(exitcode=3)
+        worker.stop(exitcode=5)
+        assert worker.exitcode == 3
+
+    def test_shutdown_records_phase_history(self):
+        worker = self.worker
+        worker.blueprint = Mock(name='blueprint')
+        worker._shutdown()
+        phases = [p for p, _ in worker.shutdown.history]
+        assert phases == [
+            ShutdownPhase.DRAIN,
+            ShutdownPhase.CLOSE_RESOURCES,
+            ShutdownPhase.CLOSED,
+        ]
+        # a repeated shutdown does not append further phases
+        worker._shutdown()
+        assert [p for p, _ in worker.shutdown.history] == phases
 
     def test_warm_shutdown_does_not_cap_the_broker_socket(self):
         # A warm shutdown runs against a healthy broker and still has acks to
