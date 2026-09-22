@@ -4,7 +4,7 @@ import pytest
 
 import t.skip
 from celery.exceptions import ImproperlyConfigured
-from celery.worker.components import Beat, Hub, Pool, Timer
+from celery.worker.components import Beat, Consumer, Hub, Pool, Timer
 
 # some of these are tested in test_worker, so I've only written tests
 # here to complete coverage.  Should move everything to this module at some
@@ -116,6 +116,37 @@ class test_Pool:
         comp.create(w)
 
         assert comp.instantiate.call_args[1]['forking_enable'] is False
+
+
+class test_Consumer:
+    def test_standard_rate_limit_keeps_prefetch_multiplier(self, app):
+        app.conf.worker_rate_limit_scheduler = 'standard'
+        app.conf.worker_fair_rate_limits = False
+        w = Mock()
+        w.app = app
+        w.max_concurrency = 2
+        w.prefetch_multiplier = 4
+        component = Consumer(w)
+        component.instantiate = Mock(return_value=Mock())
+
+        component.create(w)
+
+        assert w.prefetch_multiplier == 4
+        assert component.instantiate.call_args.kwargs['initial_prefetch_count'] == 8
+
+    def test_fair_rate_limit_forces_one_slot_per_process(self, app):
+        app.conf.worker_rate_limit_scheduler = 'FAIR'
+        w = Mock()
+        w.app = app
+        w.max_concurrency = 2
+        w.prefetch_multiplier = 4
+        component = Consumer(w)
+        component.instantiate = Mock(return_value=Mock())
+
+        component.create(w)
+
+        assert w.prefetch_multiplier == 1
+        assert component.instantiate.call_args.kwargs['initial_prefetch_count'] == 2
 
 
 class test_Beat:

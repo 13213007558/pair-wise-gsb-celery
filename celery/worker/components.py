@@ -224,6 +224,9 @@ class Consumer(bootsteps.StartStopStep):
     last = True
 
     def create(self, w):
+        if (str(w.app.conf.worker_rate_limit_scheduler).lower() == 'fair'
+                or w.app.conf.worker_fair_rate_limits):
+            w.prefetch_multiplier = 1
         if w.max_concurrency:
             prefetch_count = max(w.max_concurrency, 1) * w.prefetch_multiplier
         else:

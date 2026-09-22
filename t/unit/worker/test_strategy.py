@@ -142,6 +142,12 @@ class test_default_strategy_proto2:
             task_buckets_mock.__getitem__.side_effect = (
                 lambda key: bucket if key == sig.task else None
             )
+            consumer.get_task_bucket = Mock(
+                side_effect=lambda task, request=None: bucket
+                if task.name == sig.task else None
+            )
+        else:
+            consumer.get_task_bucket = Mock(return_value=None)
         consumer.controller.state.revoked = set()
         consumer.disable_rate_limits = not rate_limits
         consumer.event_dispatcher.enabled = events

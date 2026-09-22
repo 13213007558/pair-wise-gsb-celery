@@ -1040,12 +1040,21 @@ General
     words, the task starts at the later of the two: its ETA, or the
     next slot allowed by the rate limit.
 
+.. attribute:: Task.rate_limit_scope
+
+    Scope used by :setting:`worker_rate_limit_scheduler` when it is set to
+    ``"fair"``. When unset, each task type gets its own bucket. If set to the
+    same static value on multiple tasks, those tasks share one bucket. It may
+    also be a callable receiving the current request, and a message's
+    ``rate_limit_scope`` header takes precedence over this attribute.
+
 .. warning::
 
     A rate-limited task still counts against the worker's prefetch count
-    while it waits to run. Once all of a worker's prefetched slots are occupied
-    by rate-limited tasks, the worker stops fetching new messages from the broker
-    entirely, including messages for tasks that have no rate limit of their own.
+    while it waits to run with the standard rate-limit scheduler. Once all of
+    a worker's prefetched slots are occupied by rate-limited tasks, the
+    worker stops fetching new messages from the broker entirely, including
+    messages for tasks that have no rate limit of their own.
 
     For example, consider a worker that handles two tasks, ``A`` and ``B``,
     where ``A`` is rate limited and ``B`` is not. A burst of ``A`` messages
@@ -1053,8 +1062,9 @@ General
     the broker untouched until those rate-limited ``A`` tasks drain, even
     though ``B`` has no rate limit of its own.
 
-    To avoid this, rate-limited tasks should be routed to their own
-    dedicated workers (see :ref:`guide-routing`).
+    To avoid this with the standard scheduler, rate-limited tasks should be
+    routed to their own dedicated workers (see :ref:`guide-routing`), or use
+    the fair scheduler described in :ref:`worker-rate-limits`.
 
 .. attribute:: Task.time_limit
 

@@ -119,7 +119,7 @@ def default(task, app, consumer,
     call_at = consumer.timer.call_at
     apply_eta_task = consumer.apply_eta_task
     rate_limits_enabled = not consumer.disable_rate_limits
-    get_bucket = consumer.task_buckets.__getitem__
+    get_bucket = consumer.get_task_bucket
     handle = consumer.on_task_request
     limit_task = consumer._limit_task
     limit_post_eta = consumer._limit_post_eta
@@ -188,7 +188,7 @@ def default(task, app, consumer,
                       req.eta, exc, req.info(safe=True), exc_info=True)
                 req.reject(requeue=False)
         if rate_limits_enabled:
-            bucket = get_bucket(task.name)
+            bucket = get_bucket(task, req)
 
         if eta and bucket:
             consumer.qos.increment_eventually()

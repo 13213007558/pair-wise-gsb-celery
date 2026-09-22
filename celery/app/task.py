@@ -249,6 +249,12 @@ class Task:
     #: a minute),`'100/h'` (hundred tasks an hour)
     rate_limit = None
 
+    #: Optional shared rate-limit scope. Defaults to the task type.
+    #:
+    #: This is used by the fair rate-limit scheduler. It may be a static
+    #: value or a callable receiving the active request.
+    rate_limit_scope = None
+
     #: If enabled the worker won't store task state and return values
     #: for this task.  Defaults to the :setting:`task_ignore_result`
     #: setting.

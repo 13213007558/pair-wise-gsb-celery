@@ -3690,6 +3690,65 @@ Default: Disabled (rate limits enabled).
 
 Disable all rate limits, even if tasks has explicit rate limits set.
 
+.. setting:: worker_rate_limit_scheduler
+
+``worker_rate_limit_scheduler``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``"standard"``.
+
+Selects how per-task rate limits are enforced. ``"standard"`` keeps the
+historical local token bucket. Set this to ``"fair"`` to use the fair token
+bucket scheduler.
+
+Fair scheduling uses a monotonic clock per rate-limit scope. It never uses
+wall-clock changes, NTP adjustments, ETA values, or observed waiting time to
+decide whether a token is available. ETA and retry countdowns remain wall-clock
+schedules; after such a message becomes due, it is admitted through the same
+monotonic rate-limit bucket as a normal message.
+
+In fair mode, a message that cannot consume a token is rejected and requeued to
+its broker queue. The source consumer queue is paused for exactly the calculated
+token delay, then resumed. Over-limit messages therefore stay under broker QoS
+control instead of accumulating without bound in worker memory. Fair mode also
+uses an effective :setting:`worker_prefetch_multiplier` of one so a full
+prefetch window cannot be occupied by one queue.
+
+If a queue mixes rate-limited and unlimited task types, head-of-line ordering
+may still delay an unlimited message behind the queue's front message. Separate
+queues should be used when strict task-type isolation is required.
+
+.. setting:: worker_rate_limit_burst
+
+``worker_rate_limit_burst``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``1``.
+
+Maximum idle credit, in requests, saved by each fair token bucket. The default
+preserves Celery's historical one-token capacity and prevents a stream of
+messages from being admitted as a batch.
+
+.. setting:: worker_rate_limit_default_scope
+
+``worker_rate_limit_default_scope``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``None`` (use the task type as the scope).
+
+When set, all task types that do not declare an explicit scope share one
+fair rate-limit bucket. Task classes may set ``rate_limit_scope``, and an
+individual message may override it with a ``rate_limit_scope`` header. Scope
+values are strings.
+
+The limiter runs independently in each worker process. It provides local
+fairness and approximate cluster-wide fairness when workers have comparable
+configuration and availability; it does not implement a global distributed
+rate.
+
+``worker_fair_rate_limits`` is accepted as a compatibility alias that selects
+the fair scheduler when :setting:`worker_rate_limit_scheduler` is ``standard``.
+
 .. setting:: worker_state_db
 
 ``worker_state_db``

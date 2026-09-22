@@ -834,6 +834,28 @@ list of workers you can include the ``destination`` argument:
     This won't affect workers with the
     :setting:`worker_disable_rate_limits` setting enabled.
 
+Fair scheduling
+---------------
+
+Set :setting:`worker_rate_limit_scheduler` to ``"fair"`` to schedule
+rate-limited requests with a monotonic, scope-keyed token bucket. The default
+scope is the task type. Tasks can declare ``rate_limit_scope``, or a message
+can provide a ``rate_limit_scope`` header, to share one bucket across task
+types.
+
+The fair scheduler reserves a token before sending work to the pool. If no
+token is available, the request is requeued to its broker queue and only that
+source queue is paused until the next monotonic token time. This keeps the
+backlog under broker prefetch control, avoids unbounded in-memory queues, and
+lets consumers continue receiving from other queues. Fair mode forces
+effective prefetch to one message per pool slot so a burst from one queue
+cannot fill the entire prefetch window.
+
+ETA and retry countdowns are separate wall-clock schedules. When they elapse,
+the due request is still checked against the monotonic rate-limit token bucket.
+Rate updates and broker reconnects preserve the next scheduled grant for a
+scope; reconnecting does not reset already issued quota.
+
 .. _worker-max-tasks-per-child:
 
 Max tasks per child setting

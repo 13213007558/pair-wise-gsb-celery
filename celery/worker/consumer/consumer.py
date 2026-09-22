@@ -33,6 +33,7 @@ from celery.utils.text import truncate
 from celery.utils.threads import bound_open_broker_sockets
 from celery.utils.time import humanize_seconds, rate
 from celery.worker import loops
+from celery.worker.consumer.rate_limit import FairRateLimiter, FairTokenBucket
 from celery.worker.state import (active_requests, maybe_shutdown, requests, reserved_requests, scheduled_requests,
                                  successful_requests, task_reserved)
 
@@ -224,8 +225,23 @@ class Consumer:
         # running consumers. See ``on_connection_error_after_connected``.
         self.qos_global = None
 
-        # this contains a tokenbucket for each task type by name, used for
-        # rate limits, or None if rate limits are disabled for that task.
+        self.rate_limit_scheduler = str(
+            self.app.conf.worker_rate_limit_scheduler).lower()
+        if (self.app.conf.worker_fair_rate_limits
+                and self.rate_limit_scheduler == 'standard'):
+            self.rate_limit_scheduler = 'fair'
+        self.rate_limit_burst = max(
+            1, int(self.app.conf.worker_rate_limit_burst or 1))
+        self.paused_rate_limit_queues = {}
+        if self.rate_limit_scheduler == 'fair':
+            self.fair_rate_limiter = FairRateLimiter(self.app)
+        elif self.rate_limit_scheduler == 'standard':
+            self.fair_rate_limiter = None
+        else:
+            raise ValueError(
+                'worker_rate_limit_scheduler must be "standard" or "fair"')
+        # The standard scheduler contains a token bucket for each task type.
+        # The fair scheduler stores buckets in ``fair_rate_limiter`` instead.
         self.task_buckets = defaultdict(lambda: None)
         self.reset_rate_limits()
 
@@ -298,7 +314,41 @@ class Consumer:
         limit = rate(getattr(type, 'rate_limit', None))
         return TokenBucket(limit, capacity=1) if limit else None
 
+    def _request_uses_no_ack(self, request):
+        channel = getattr(request.message, 'channel', None)
+        no_ack_consumers = getattr(channel, 'no_ack_consumers', None)
+        if no_ack_consumers is None:
+            return False
+        consumer_tag = request.message.delivery_info.get('consumer_tag')
+        try:
+            return consumer_tag in no_ack_consumers
+        except TypeError:
+            return False
+
+    def _fair_bucket_for_task(self, type, request=None):
+        if type is None or not rate(getattr(type, 'rate_limit', None)):
+            return None
+        if request is not None and self._request_uses_no_ack(request):
+            bucket = self.task_buckets.get(type.name)
+            if bucket is not None:
+                return bucket
+            return self.bucket_for_task(type)
+        return self.fair_rate_limiter.bucket_for(type, request)
+
+    def get_task_bucket(self, task, request=None):
+        if self.fair_rate_limiter is not None:
+            return self._fair_bucket_for_task(task, request)
+        return self.task_buckets[task.name]
+
     def reset_rate_limits(self):
+        if self.fair_rate_limiter is not None:
+            affected_scopes = self.fair_rate_limiter.reset()
+            self._resume_rate_limited_queues(affected_scopes)
+            self.task_buckets.update(
+                (n, self.bucket_for_task(t))
+                for n, t in self.app.tasks.items()
+            )
+            return
         self.task_buckets.update(
             (n, self.bucket_for_task(t)) for n, t in self.app.tasks.items()
         )
@@ -331,6 +381,76 @@ class Consumer:
         task_reserved(request)
         self.on_task_request(request)
 
+    def _queue_name_for_request(self, request):
+        consumer = getattr(self, 'task_consumer', None)
+        active_tags = getattr(consumer, '_active_tags', {}) if consumer else {}
+        consumer_tag = getattr(request.message, 'delivery_info', {}).get(
+            'consumer_tag')
+        for queue_name, tag in active_tags.items():
+            if tag == consumer_tag:
+                return queue_name
+        return request.delivery_info.get('routing_key')
+
+    def _pause_rate_limited_queue(self, scope, request, delay):
+        queue_name = self._queue_name_for_request(request)
+        if not queue_name or queue_name in self.paused_rate_limit_queues:
+            return
+        consumer = getattr(self, 'task_consumer', None)
+        if consumer is not None and consumer.consuming_from(queue_name):
+            consumer.cancel_by_queue(queue_name)
+        entry = self.timer.call_after(
+            max(0.0, delay), self._resume_rate_limited_queue,
+            (queue_name,), priority=0,
+        )
+        self.paused_rate_limit_queues[queue_name] = (scope, entry)
+
+    def _resume_rate_limited_queue(self, queue_name):
+        self.paused_rate_limit_queues.pop(queue_name, None)
+        self.fair_rate_limiter.prune_reclaimable()
+        if getattr(self, 'task_consumer', None) is None:
+            return
+        queue = self.app.amqp.queues.consume_from.get(queue_name)
+        if queue is None:
+            return
+        if not self.task_consumer.consuming_from(queue_name):
+            self.task_consumer.add_queue(queue)
+            self.task_consumer.consume()
+
+    def _resume_rate_limited_queues(self, scopes=None):
+        for queue_name in tuple(self.paused_rate_limit_queues):
+            scope, entry = self.paused_rate_limit_queues[queue_name]
+            if scopes is not None and scope not in scopes:
+                continue
+            self.paused_rate_limit_queues.pop(queue_name)
+            if entry is not None:
+                try:
+                    self.timer.cancel(entry)
+                except (AttributeError, ValueError):
+                    pass
+            self._resume_rate_limited_queue(queue_name)
+
+    def _cancel_paused_rate_limit_queues(self):
+        paused_queues = getattr(self, 'paused_rate_limit_queues', None)
+        if not paused_queues:
+            return
+        for queue_name, (_, entry) in tuple(paused_queues.items()):
+            paused_queues.pop(queue_name, None)
+            if entry is not None:
+                try:
+                    self.timer.cancel(entry)
+                except (AttributeError, ValueError):
+                    pass
+
+    def _limit_defer_or_dispatch(self, request, bucket):
+        scope = self.fair_rate_limiter.scope_for(request.task, request)
+        delay = bucket.reserve()
+        if delay is None:
+            self._limit_move_to_pool(request)
+            return None
+        self._pause_rate_limited_queue(scope, request, delay)
+        request.reject(requeue=True)
+        return delay
+
     def _schedule_bucket_request(self, bucket):
         while True:
             try:
@@ -356,11 +476,17 @@ class Consumer:
                 break
 
     def _limit_task(self, request, bucket, tokens):
+        if self.fair_rate_limiter is not None and isinstance(
+                bucket, FairTokenBucket):
+            return self._limit_defer_or_dispatch(request, bucket)
         bucket.add((request, tokens))
         return self._schedule_bucket_request(bucket)
 
     def _limit_post_eta(self, request, bucket, tokens):
         self.qos.decrement_eventually()
+        if self.fair_rate_limiter is not None and isinstance(
+                bucket, FairTokenBucket):
+            return self._limit_defer_or_dispatch(request, bucket)
         bucket.add((request, tokens))
         return self._schedule_bucket_request(bucket)
 
@@ -534,6 +660,7 @@ class Consumer:
         # to the current channel.
         if self.controller and self.controller.semaphore:
             self.controller.semaphore.clear()
+        self._cancel_paused_rate_limit_queues()
         for bucket in self.task_buckets.values():
             if bucket:
                 bucket.clear_pending()
