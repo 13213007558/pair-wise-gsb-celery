@@ -16,6 +16,7 @@ from celery.utils.time import rate
 
 from . import state as worker_state
 from .request import Request
+from .revocation import EXACT, BaseRevokedStampsStore, matching_stamp_values
 
 __all__ = ('Panel',)
 
@@ -160,7 +161,8 @@ def revoke(state, task_id, terminate=False, signal=None, **kwargs):
     variadic='headers',
     signature='[key1=value1 [key2=value2 [... [keyN=valueN]]]]',
 )
-def revoke_by_stamped_headers(state, headers, terminate=False, signal=None, **kwargs):
+def revoke_by_stamped_headers(state, headers, terminate=False, signal=None,
+                              strategy=None, expires=None, **kwargs):
     """Revoke task by header (or list of headers).
 
     Keyword Arguments:
@@ -168,6 +170,13 @@ def revoke_by_stamped_headers(state, headers, terminate=False, signal=None, **kw
                              If headers is a list, it will be converted to a dictionary.
         terminate (bool): Also terminate the process if the task is active.
         signal (str): Name of signal to use for terminate (e.g., ``KILL``).
+        strategy (str | dict): Stamp matching strategy: ``exact``
+            (default) or ``regex``.  A dictionary maps individual
+            header names to strategies.
+        expires (float): Seconds until the revocation expires and is
+            cleaned up.  Defaults to
+            :setting:`worker_revoked_stamps_expires`; a false value
+            means the revocation never expires.
     Sample headers input:
         {'mtask_id': [id1, id2, id3]}
     """
@@ -180,9 +189,16 @@ def revoke_by_stamped_headers(state, headers, terminate=False, signal=None, **kw
     if isinstance(headers, list):
         headers = {h.split('=')[0]: h.split('=')[1] for h in headers}
 
+    if expires is None:
+        expires = state.app.conf.worker_revoked_stamps_expires
+
+    strategies = {}
     for header, stamps in headers.items():
-        updated_stamps = maybe_list(worker_state.revoked_stamps.get(header) or []) + list(maybe_list(stamps))
-        worker_state.revoked_stamps[header] = updated_stamps
+        strategies[header] = _header_strategy(strategy, header)
+        worker_state.revoked_stamps.add(
+            header, stamps, strategy=strategies[header], expires=expires)
+
+    _persist_revoked_stamps(state)
 
     if not terminate:
         return ok(f'headers {headers} flagged as revoked, but not terminated')
@@ -197,21 +213,53 @@ def revoke_by_stamped_headers(state, headers, terminate=False, signal=None, **kw
 
     for req in active_requests:
         # Check stamps exist
-        if hasattr(req, "stamps") and req.stamps:
-            # if so, check if any stamps match a revoked stamp
-            for expected_header_key, expected_header_value in headers.items():
-                if expected_header_key in req.stamps:
-                    expected_header_value = maybe_list(expected_header_value)
-                    actual_header = maybe_list(req.stamps[expected_header_key])
-                    matching_stamps_for_request = set(actual_header) & set(expected_header_value)
-                    # Check any possible match regardless if the stamps are a sequence or not
-                    if matching_stamps_for_request:
-                        terminated_scheme_to_stamps_mapping[expected_header_key].update(matching_stamps_for_request)
-                        req.terminate(state.consumer.pool, signal=signum)
+        req_stamps = getattr(req, 'stamps', None)
+        if not req_stamps:
+            continue
+        # if so, check if any stamps match a revoked stamp
+        for expected_header_key, expected_header_value in headers.items():
+            if expected_header_key not in req_stamps:
+                continue
+            matching_stamps_for_request = matching_stamp_values(
+                expected_header_value,
+                req_stamps[expected_header_key],
+                strategy=strategies[expected_header_key],
+            )
+            # Check any possible match regardless if the stamps are a sequence or not
+            if matching_stamps_for_request:
+                terminated_scheme_to_stamps_mapping[expected_header_key].update(matching_stamps_for_request)
+                req.terminate(state.consumer.pool, signal=signum)
 
     if not terminated_scheme_to_stamps_mapping:
         return ok(f'headers {headers} were not terminated')
     return ok(f'headers {terminated_scheme_to_stamps_mapping} revoked')
+
+
+def _header_strategy(strategy, header):
+    if isinstance(strategy, dict):
+        strategy = strategy.get(header, EXACT)
+    return strategy or EXACT
+
+
+def _persist_revoked_stamps(state):
+    """Persist revoked stamps to the configured revocation store, if any.
+
+    The store is shared with other workers (e.g. the result backend), so
+    the state merged back from it may also contain revocations issued
+    elsewhere; adopt those into the local in-memory mapping.
+    """
+    consumer = getattr(state, 'consumer', None)
+    controller = getattr(consumer, 'controller', None)
+    store = getattr(controller, 'revocation_store', None)
+    if not isinstance(store, BaseRevokedStampsStore):
+        return
+    try:
+        merged = store.save(worker_state.revoked_stamps)
+    except Exception as exc:
+        logger.warning('Failed to persist revoked stamps: %r', exc)
+        return
+    if merged is not None:
+        worker_state.revoked_stamps.merge(merged)
 
 
 def _revoke(state, task_ids, terminate=False, signal=None, **kwargs):
@@ -388,7 +436,7 @@ def heartbeat(state):
 # -- Worker
 
 @inspect_command(visible=False)
-def hello(state, from_node, revoked=None, **kwargs):
+def hello(state, from_node, revoked=None, revoked_stamps=None, **kwargs):
     """Request mingle sync-data."""
     # pylint: disable=redefined-outer-name
     # XXX Note that this redefines `revoked`:
@@ -397,10 +445,14 @@ def hello(state, from_node, revoked=None, **kwargs):
         logger.info('sync with %s', from_node)
         if revoked:
             worker_state.revoked.update(revoked)
+        if revoked_stamps:
+            worker_state.revoked_stamps.update_from_dict(revoked_stamps)
         # Do not send expired items to the other worker.
         worker_state.revoked.purge()
+        worker_state.revoked_stamps.purge()
         return {
             'revoked': worker_state.revoked._data,
+            'revoked_stamps': worker_state.revoked_stamps.as_dict(),
             'clock': state.app.clock.forward(),
         }
 

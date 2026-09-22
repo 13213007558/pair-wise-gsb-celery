@@ -324,6 +324,34 @@ class test_default_strategy_proto2:
         finally:
             state.revoked.discard(task.id)
 
+    def test_when_revoked_by_stamped_headers(self):
+        try:
+            with self._context(self.add.s(2, 2)) as C:
+                C.message.headers.update({
+                    'stamps': {'tenant_id': 't-1'},
+                    'stamped_headers': ['tenant_id'],
+                })
+                state.revoked_stamps.add('tenant_id', 't-1')
+                C()
+                with pytest.raises(ValueError):
+                    C.get_request()
+                C.message.ack.assert_called_once()
+        finally:
+            state.revoked_stamps.clear()
+
+    def test_when_not_revoked_by_stamped_headers(self):
+        try:
+            with self._context(self.add.s(2, 2)) as C:
+                C.message.headers.update({
+                    'stamps': {'tenant_id': 't-2'},
+                    'stamped_headers': ['tenant_id'],
+                })
+                state.revoked_stamps.add('tenant_id', 't-1')
+                C()
+                assert C.was_reserved()
+        finally:
+            state.revoked_stamps.clear()
+
 
 class test_default_strategy_proto1(test_default_strategy_proto2):
 

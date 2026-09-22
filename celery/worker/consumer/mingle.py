@@ -51,7 +51,10 @@ class Mingle(bootsteps.StartStopStep):
     def send_hello(self, c):
         inspect = c.app.control.inspect(timeout=1.0, connection=c.connection)
         our_revoked = c.controller.state.revoked
-        replies = inspect.hello(c.hostname, our_revoked._data) or {}
+        our_revoked_stamps = c.controller.state.revoked_stamps
+        replies = inspect.hello(
+            c.hostname, our_revoked._data,
+            revoked_stamps=our_revoked_stamps.as_dict()) or {}
         replies.pop(c.hostname, None)  # delete my own response
         return replies
 
@@ -64,9 +67,11 @@ class Mingle(bootsteps.StartStopStep):
         except Exception as exc:  # pylint: disable=broad-except
             exception('mingle: sync with %s failed: %r', nodename, exc)
 
-    def sync_with_node(self, c, clock=None, revoked=None, **kwargs):
+    def sync_with_node(self, c, clock=None, revoked=None,
+                       revoked_stamps=None, **kwargs):
         self.on_clock_event(c, clock)
         self.on_revoked_received(c, revoked)
+        self.on_revoked_stamps_received(c, revoked_stamps)
 
     def on_clock_event(self, c, clock):
         c.app.clock.adjust(clock) if clock else c.app.clock.forward()
@@ -74,3 +79,7 @@ class Mingle(bootsteps.StartStopStep):
     def on_revoked_received(self, c, revoked):
         if revoked:
             c.controller.state.revoked.update(revoked)
+
+    def on_revoked_stamps_received(self, c, revoked_stamps):
+        if revoked_stamps:
+            c.controller.state.revoked_stamps.update_from_dict(revoked_stamps)

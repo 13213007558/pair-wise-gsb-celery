@@ -366,6 +366,8 @@ NAMESPACES = Namespace(
         redirect_stdouts_level=Option(
             'WARNING', old={'celery_redirect_stdouts_level'},
         ),
+        revoked_stamps_expires=Option(10800.0, type='float'),
+        revoked_stamps_store=Option('memory', type='string'),
         send_task_events=Option(
             False, type='bool', old={'celery_send_events'},
         ),

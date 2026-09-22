@@ -4,7 +4,10 @@ import pytest
 
 import t.skip
 from celery.exceptions import ImproperlyConfigured
-from celery.worker.components import Beat, Hub, Pool, Timer
+from celery.worker.components import (Beat, Hub, Pool, RevocationStore,
+                                      Timer)
+from celery.worker.revocation import (BackendRevokedStampsStore,
+                                      RevokedStamps)
 
 # some of these are tested in test_worker, so I've only written tests
 # here to complete coverage.  Should move everything to this module at some
@@ -18,6 +21,43 @@ class test_Timer:
         w.use_eventloop = True
         Timer(w).create(w)
         assert not w.timer.queue
+
+
+class test_RevocationStore:
+
+    def test_disabled_by_default(self, app):
+        app.conf.worker_revoked_stamps_store = 'memory'
+        w = Mock(name='w', app=app)
+        RevocationStore(w).create(w)
+        assert w.revocation_store is None
+
+    def test_creates_backend_store(self, app):
+        app.conf.worker_revoked_stamps_store = 'backend'
+        w = Mock(name='w', app=app)
+        RevocationStore(w).create(w)
+        assert isinstance(w.revocation_store, BackendRevokedStampsStore)
+
+    def test_loads_persisted_state_at_startup(self, app):
+        persisted = RevokedStamps()
+        persisted.add('tenant_id', 't-1', expires=0)
+        store = Mock(name='store')
+        store.load.return_value = persisted
+        w = Mock(name='w', app=app)
+        with patch('celery.worker.revocation.create_revocation_store',
+                   return_value=store):
+            RevocationStore(w).create(w)
+        assert w.revocation_store is store
+        w.state.revoked_stamps.merge.assert_called_with(persisted)
+
+    def test_load_failure_does_not_break_startup(self, app):
+        store = Mock(name='store')
+        store.load.side_effect = ConnectionError('broker down')
+        w = Mock(name='w', app=app)
+        with patch('celery.worker.revocation.create_revocation_store',
+                   return_value=store):
+            RevocationStore(w).create(w)
+        assert w.revocation_store is store
+        w.state.revoked_stamps.merge.assert_not_called()
 
 
 class test_Hub:

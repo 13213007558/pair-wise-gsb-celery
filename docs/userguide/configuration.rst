@@ -3703,6 +3703,44 @@ may be appended to the file name (depending on Python version).
 
 Can also be set via the :option:`celery worker --statedb` argument.
 
+.. setting:: worker_revoked_stamps_expires
+
+`worker_revoked_stamps_expires`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: 10800.0 (3 hours).
+
+.. versionadded:: 5.7
+
+Time in seconds before a revocation issued by
+:control:`revoke_by_stamped_headers` expires and is cleaned up, so the
+revoked stamped headers mapping cannot grow without bounds.  Can be
+overridden per revocation with the `expires` argument of
+`revoke_by_stamped_headers`; a false value means revocations never
+expire.
+
+.. setting:: worker_revoked_stamps_store
+
+`worker_revoked_stamps_store`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: `'memory'`.
+
+.. versionadded:: 5.7
+
+Persistent storage strategy for revoked stamped headers:
+
+- `'memory'`: revocations are kept in worker memory only and are lost
+  when the worker restarts (unless :setting:`worker_state_db` is set,
+  which always persists them in the worker state file).
+- `'backend'`: revocations are additionally stored in the key-value
+  result backend, shared by all workers using that backend, so they
+  survive restarts and concurrent revocations are merged instead of
+  lost.  Expired entries are purged on every read and write.
+- A dotted path to a custom store class implementing
+  :class:`celery.worker.revocation.BaseRevokedStampsStore`, or an
+  instance of one.
+
 .. setting:: worker_timer_precision
 
 ``worker_timer_precision``

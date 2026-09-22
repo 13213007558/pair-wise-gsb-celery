@@ -57,6 +57,7 @@
     celery.apps.multi
     celery.worker
     celery.worker.request
+    celery.worker.revocation
     celery.worker.state
     celery.worker.strategy
     celery.worker.consumer

@@ -157,6 +157,42 @@ class test_Persistent:
         for item in data2:
             assert item in saved
 
+    def test_sync_and_merge_revoked_stamps(self, p):
+        p.db.pop('zrevoked_stamps', None)
+        state.revoked_stamps.clear()
+        try:
+            state.revoked_stamps.add('tenant_id', 't-1', expires=0)
+            state.revoked_stamps.add(
+                'deployment_id', 'web-.*', strategy='regex', expires=0)
+            p.sync()
+            assert p.db['zrevoked_stamps']
+            state.revoked_stamps.clear()
+            assert state.revoked_stamps.match({'tenant_id': 't-1'}) is None
+            p.merge()
+            assert state.revoked_stamps.match({'tenant_id': 't-1'})
+            assert state.revoked_stamps.match({'deployment_id': 'web-42'})
+            assert state.revoked_stamps.match(
+                {'deployment_id': 'api-1'}) is None
+        finally:
+            state.revoked_stamps.clear()
+            p.db.pop('zrevoked_stamps', None)
+
+    def test_merge_revoked_stamps_missing_key(self, p):
+        p.db.pop('zrevoked_stamps', None)
+        state.revoked_stamps.clear()
+        p.merge()  # statedb without zrevoked_stamps must not raise
+        assert not state.revoked_stamps
+
+    def test_merge_revoked_stamps_purges_expired_at_boot(self, p):
+        p.db.pop('zrevoked_stamps', None)
+        state.revoked_stamps.clear()
+        state.revoked_stamps.add(
+            'tenant_id', 't-1', expires=10, now=time() - 100)
+        p.sync()
+        state.revoked_stamps.clear()
+        p.merge()
+        assert not state.revoked_stamps
+
 
 class SimpleReq:
 

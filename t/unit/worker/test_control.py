@@ -283,6 +283,46 @@ class test_ControlPanel:
         })
         assert 'expired_in_past' not in x['revoked']
 
+    def test_hello_syncs_revoked_stamps(self):
+        consumer = Consumer(self.app)
+        panel = self.create_panel(consumer=consumer)
+        panel.state.hostname = 'elaine@vandelay.com'
+        worker_state.revoked_stamps.clear()
+        try:
+            x = panel.handle('hello', {
+                'from_node': 'george@vandelay.com',
+                'revoked_stamps': {
+                    'version': 1,
+                    'stamps': {
+                        'tenant_id': [
+                            {'value': 't-1', 'expires': None,
+                             'strategy': 'exact'},
+                        ],
+                    },
+                },
+            })
+            assert worker_state.revoked_stamps.match({'tenant_id': 't-1'})
+            assert x['revoked_stamps']['stamps']['tenant_id'] == [
+                {'value': 't-1', 'expires': None, 'strategy': 'exact'},
+            ]
+        finally:
+            worker_state.revoked_stamps.clear()
+
+    def test_hello_does_not_send_expired_revoked_stamps(self):
+        consumer = Consumer(self.app)
+        panel = self.create_panel(consumer=consumer)
+        panel.state.hostname = 'elaine@vandelay.com'
+        worker_state.revoked_stamps.clear()
+        worker_state.revoked_stamps.add(
+            'tenant_id', 't-1', expires=10, now=time.time() - 100)
+        try:
+            x = panel.handle('hello', {
+                'from_node': 'george@vandelay.com',
+            })
+            assert x['revoked_stamps']['stamps'] == {}
+        finally:
+            worker_state.revoked_stamps.clear()
+
     def test_conf(self):
         consumer = Consumer(self.app)
         panel = self.create_panel(consumer=consumer)
@@ -1105,3 +1145,134 @@ class test_ControlPanel:
         assert 'test-123' in worker_state.revoked_stamps.get('monitoring_id', [])
 
         worker_state.active_requests.clear()
+
+    def test_revoke_by_stamped_headers_regex_strategy(self):
+        state = self.create_state()
+        state.consumer = Mock()
+        worker_state.revoked_stamps.clear()
+        try:
+            control.revoke_by_stamped_headers(
+                state, {'tenant_id': 't-.*'}, strategy='regex')
+            assert worker_state.revoked_stamps.match({'tenant_id': 't-42'})
+            assert worker_state.revoked_stamps.match(
+                {'tenant_id': 'other'}) is None
+        finally:
+            worker_state.revoked_stamps.clear()
+
+    def test_revoke_by_stamped_headers_per_header_strategy(self):
+        state = self.create_state()
+        state.consumer = Mock()
+        worker_state.revoked_stamps.clear()
+        try:
+            control.revoke_by_stamped_headers(
+                state,
+                {'tenant_id': 't-.*', 'deployment_id': 'web-1'},
+                strategy={'tenant_id': 'regex'},
+            )
+            assert worker_state.revoked_stamps.match({'tenant_id': 't-9'})
+            assert worker_state.revoked_stamps.match(
+                {'deployment_id': 'web-1'})
+            assert worker_state.revoked_stamps.match(
+                {'deployment_id': 'web-2'}) is None
+        finally:
+            worker_state.revoked_stamps.clear()
+
+    def test_revoke_by_stamped_headers_unknown_strategy(self):
+        state = self.create_state()
+        state.consumer = Mock()
+        worker_state.revoked_stamps.clear()
+        with pytest.raises(ValueError):
+            control.revoke_by_stamped_headers(
+                state, {'tenant_id': 't-1'}, strategy='fuzzy')
+
+    def test_revoke_by_stamped_headers_regex_terminates_matching_request(self):
+        state = self.create_state()
+        state.consumer = Mock()
+
+        request = Mock()
+        request.id = 'task-with-regex-stamp'
+        request.stamps = {'tenant_id': 't-42'}
+        request.terminate = Mock()
+        worker_state.active_requests.add(request)
+
+        try:
+            with patch('celery.worker.control._signals.signum',
+                       return_value=15):
+                control.revoke_by_stamped_headers(
+                    state, {'tenant_id': 't-.*'},
+                    strategy='regex', terminate=True)
+            request.terminate.assert_called_once()
+        finally:
+            worker_state.active_requests.discard(request)
+            worker_state.revoked_stamps.clear()
+
+    def test_revoke_by_stamped_headers_expires(self):
+        state = self.create_state()
+        state.consumer = Mock()
+        worker_state.revoked_stamps.clear()
+        try:
+            control.revoke_by_stamped_headers(
+                state, {'tenant_id': 't-1'}, expires=100)
+            entry = worker_state.revoked_stamps._data['tenant_id']['t-1']
+            assert entry['expires'] is not None
+            control.revoke_by_stamped_headers(
+                state, {'tenant_id': 't-2'}, expires=0)
+            entry = worker_state.revoked_stamps._data['tenant_id']['t-2']
+            assert entry['expires'] is None
+        finally:
+            worker_state.revoked_stamps.clear()
+
+    def test_revoke_by_stamped_headers_default_expires_from_conf(self):
+        state = self.create_state()
+        state.consumer = Mock()
+        worker_state.revoked_stamps.clear()
+        self.app.conf.worker_revoked_stamps_expires = 100.0
+        try:
+            control.revoke_by_stamped_headers(state, {'tenant_id': 't-1'})
+            entry = worker_state.revoked_stamps._data['tenant_id']['t-1']
+            assert entry['expires'] is not None
+        finally:
+            worker_state.revoked_stamps.clear()
+
+    def test_revoke_by_stamped_headers_persisted_to_store(self):
+        from celery.worker.revocation import (BaseRevokedStampsStore,
+                                              RevokedStamps)
+
+        class RecordingStore(BaseRevokedStampsStore):
+            def __init__(self):
+                self.saved = None
+
+            def load(self):
+                return RevokedStamps()
+
+            def save(self, revoked_stamps):
+                self.saved = revoked_stamps
+                merged = RevokedStamps()
+                merged.merge(revoked_stamps)
+                merged.add('deployment_id', 'd-elsewhere')
+                return merged
+
+        store = RecordingStore()
+        state = self.create_state()
+        state.consumer = Mock()
+        state.consumer.controller.revocation_store = store
+        worker_state.revoked_stamps.clear()
+        try:
+            control.revoke_by_stamped_headers(state, {'tenant_id': 't-1'})
+            assert store.saved.match({'tenant_id': 't-1'})
+            # revocations made by other workers are adopted locally
+            assert worker_state.revoked_stamps.match(
+                {'deployment_id': 'd-elsewhere'})
+        finally:
+            worker_state.revoked_stamps.clear()
+
+    def test_revoke_by_stamped_headers_without_store_does_not_persist(self):
+        state = self.create_state()
+        state.consumer = Mock()
+        state.consumer.controller.revocation_store = None
+        worker_state.revoked_stamps.clear()
+        try:
+            r = control.revoke_by_stamped_headers(state, {'tenant_id': 't-1'})
+            assert 'flagged as revoked' in r['ok']
+        finally:
+            worker_state.revoked_stamps.clear()

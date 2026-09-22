@@ -676,15 +676,64 @@ and each task that has a stamped header matching the key-value pair(s) will be r
 
 .. warning::
 
-    The revoked headers mapping is not persistent across restarts, so if you
-    restart the workers, the revoked headers will be lost and need to be
-    mapped again.
-
-.. warning::
-
     This command may perform poorly if your worker pool concurrency is high
     and terminate is enabled, since it will have to iterate over all the running
     tasks to find the ones with the specified stamped header.
+
+Matching is performed per stamped header: a task is revoked when *any* of
+its stamped headers matches a revoked value (logical OR).  The revocation
+applies to every queue the worker consumes from, and it is checked before
+a task is executed, so reserved (prefetched), scheduled (ETA/countdown)
+and retried messages carrying a matching stamp are discarded as well.
+When a running task is revoked without terminating it, its retries and
+its `link`/`link_error` callbacks keep the original stamps, so they
+cannot bypass the revocation either.
+
+By default revoked values are matched by exact equality.  Pass
+`strategy='regex'` to treat the revoked values as regular expressions
+(matched with :func:`re.match`), or a dictionary mapping header names to
+strategies to mix both:
+
+.. code-block:: pycon
+
+    >>> app.control.revoke_by_stamped_headers({'tenant_id': 'tenant-.*'}, strategy='regex')
+
+    >>> app.control.revoke_by_stamped_headers(
+    ...     {'tenant_id': 'tenant-.*', 'deployment_id': 'web-1'},
+    ...     strategy={'tenant_id': 'regex'})
+
+Revocations expire after :setting:`worker_revoked_stamps_expires`
+seconds (three hours by default) and are cleaned up automatically so
+the revoked headers mapping cannot grow without bounds.  Pass
+`expires=<seconds>` to override the TTL per revocation, or
+`expires=0` for a revocation that never expires:
+
+.. code-block:: pycon
+
+    >>> app.control.revoke_by_stamped_headers({'tenant_id': 't-1'}, expires=600)
+
+Persistent revocation
+---------------------
+
+.. versionadded:: 5.7
+
+By default the revoked headers mapping is kept in memory only.  Two
+optional persistent strategies make revocations survive worker restarts:
+
+- When :setting:`worker_state_db` is set, the revoked stamped headers
+  are stored in the worker state database file together with the revoked
+  task ids, and restored when the worker starts.
+
+- Set :setting:`worker_revoked_stamps_store` to `'backend'` to store
+  the revoked stamped headers in the (key-value) result backend.  The
+  state is then shared by every worker using the same result backend:
+  revocations issued by one worker are visible to the others, concurrent
+  revocations are merged instead of clobbering each other, and expired
+  entries are purged on every read and write.
+
+In addition, workers exchange their revoked stamped headers with the
+`mingle`/`gossip` synchronization at startup, like they already do
+for revoked task ids.
 
 **Example**
 

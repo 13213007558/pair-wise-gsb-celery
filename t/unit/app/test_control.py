@@ -116,7 +116,8 @@ class test_inspect:
     def test_hello(self):
         self.inspect.hello('george@vandelay.com')
         self.assert_broadcast_called(
-            'hello', from_node='george@vandelay.com', revoked=None)
+            'hello', from_node='george@vandelay.com', revoked=None,
+            revoked_stamps=None)
 
     def test_hello__with_revoked(self):
         revoked = LimitedSet(100)
@@ -124,7 +125,8 @@ class test_inspect:
             revoked.add(f'id{i}')
         self.inspect.hello('george@vandelay.com', revoked=revoked._data)
         self.assert_broadcast_called(
-            'hello', from_node='george@vandelay.com', revoked=revoked._data)
+            'hello', from_node='george@vandelay.com', revoked=revoked._data,
+            revoked_stamps=None)
 
     def test_memsample(self):
         self.inspect.memsample()
@@ -532,7 +534,8 @@ class test_Control:
         self.app.AsyncResult('foozbazzbar').revoke_by_stamped_headers({'foo': 'bar'})
         self.app.control.revoke_by_stamped_headers.assert_called_with(
             {'foo': 'bar'},
-            connection=None, reply=False, signal=None,
+            connection=None, reply=False, signal=None, strategy=None,
+            expires=None,
             terminate=False, timeout=None)
 
     def test_revoke_from_resultset(self):

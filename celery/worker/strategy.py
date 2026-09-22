@@ -159,7 +159,8 @@ def default(task, app, consumer,
                 'eta': req.eta,
             }
             info(_app_trace.LOG_RECEIVED, context, extra={'data': context})
-        if (req.expires or req.id in revoked_tasks) and req.revoked():
+        if (req.expires or req.id in revoked_tasks
+                or req.stamped_headers) and req.revoked():
             return
 
         signals.task_received.send(sender=consumer, request=req)

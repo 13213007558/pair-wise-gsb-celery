@@ -83,6 +83,7 @@ class WorkController:
             'celery.worker.components:Beat',
             'celery.worker.components:Timer',
             'celery.worker.components:StateDB',
+            'celery.worker.components:RevocationStore',
             'celery.worker.components:Consumer',
             'celery.worker.autoscale:WorkerComponent',
         }

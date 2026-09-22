@@ -18,6 +18,8 @@ from celery import __version__
 from celery.exceptions import ImproperlyConfigured, WorkerShutdown, WorkerTerminate
 from celery.utils.collections import LimitedSet
 
+from .revocation import RevokedStamps
+
 __all__ = (
     'SOFTWARE_INFO', 'reserved_requests', 'active_requests',
     'scheduled_requests', 'total_count', 'revoked', 'task_reserved',
@@ -110,7 +112,9 @@ all_total_count = [0]
 revoked = LimitedSet(maxlen=REVOKES_MAX, expires=REVOKE_EXPIRES)
 
 #: Mapping of stamped headers flagged for revoking.
-revoked_stamps = {}
+#: Persistent if ``statedb`` set, or if a persistent revocation store
+#: is configured (see :setting:`worker_revoked_stamps_store`).
+revoked_stamps = RevokedStamps()
 
 should_stop = None
 should_terminate = None
@@ -268,7 +272,7 @@ class Persistent:
     This is the persistent data stored by the worker when
     :option:`celery worker --statedb` is enabled.
 
-    Currently only stores revoked task id's.
+    Currently stores revoked task id's and revoked stamped headers.
     """
 
     storage = shelve
@@ -311,9 +315,12 @@ class Persistent:
 
     def _sync_with(self, d):
         self._revoked_tasks.purge()
+        self._revoked_stamps.purge()
         d.update({
             '__proto__': 3,
             'zrevoked': self.compress(self._dumps(self._revoked_tasks)),
+            'zrevoked_stamps': self.compress(
+                self._dumps(self._revoked_stamps.as_dict())),
             'clock': self.clock.forward() if self.clock else 0,
         })
         return d
@@ -330,8 +337,19 @@ class Persistent:
                 self._merge_revoked_v2(d.pop('revoked'))
             except KeyError:
                 pass
+        self._merge_revoked_stamps(d)
         # purge expired items at boot
         self._revoked_tasks.purge()
+        self._revoked_stamps.purge()
+
+    def _merge_revoked_stamps(self, d):
+        try:
+            zrevoked_stamps = d['zrevoked_stamps']
+        except KeyError:
+            return
+        if zrevoked_stamps:
+            self._revoked_stamps.update_from_dict(
+                pickle.loads(self.decompress(zrevoked_stamps)))
 
     def _merge_revoked_v3(self, zrevoked):
         if zrevoked:
@@ -354,6 +372,10 @@ class Persistent:
     @property
     def _revoked_tasks(self):
         return self.state.revoked
+
+    @property
+    def _revoked_stamps(self):
+        return self.state.revoked_stamps
 
     @cached_property
     def db(self):

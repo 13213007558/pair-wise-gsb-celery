@@ -165,7 +165,7 @@ class AsyncResult(ResultBase):
                                 reply=wait, timeout=timeout)
 
     def revoke_by_stamped_headers(self, headers, connection=None, terminate=False, signal=None,
-                                  wait=False, timeout=None):
+                                  strategy=None, expires=None, wait=False, timeout=None):
         """Send revoke signal to all workers only for tasks with matching headers values.
 
         Any worker receiving the task, or having reserved the
@@ -178,6 +178,12 @@ class AsyncResult(ResultBase):
                 on the task (if any).
             signal (str): Name of signal to send to process if terminate.
                 Default is TERM.
+            strategy (str | dict): Stamp matching strategy: ``exact``
+                (default) or ``regex``.  A dictionary maps
+                individual header names to strategies.
+            expires (float): Seconds until the revocation expires and is
+                cleaned up.  Defaults to the worker's
+                :setting:`worker_revoked_stamps_expires` setting.
             wait (bool): Wait for replies from workers.
                 The ``timeout`` argument specifies the seconds to wait.
                 Disabled by default.
@@ -186,6 +192,7 @@ class AsyncResult(ResultBase):
         """
         self.app.control.revoke_by_stamped_headers(headers, connection=connection,
                                                    terminate=terminate, signal=signal,
+                                                   strategy=strategy, expires=expires,
                                                    reply=wait, timeout=timeout)
 
     def get(self, timeout=None, propagate=True, interval=0.5,

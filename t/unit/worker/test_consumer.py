@@ -1668,6 +1668,15 @@ class test_Mingle:
             'A@example.com': {
                 'clock': 312,
                 'revoked': Aig._data,
+                'revoked_stamps': {
+                    'version': 1,
+                    'stamps': {
+                        'tenant_id': [
+                            {'value': 't-1', 'expires': None,
+                             'strategy': 'exact'},
+                        ],
+                    },
+                },
             },
             'B@example.com': {
                 'clock': 29,
@@ -1681,7 +1690,11 @@ class test_Mingle:
         our_revoked = c.controller.state.revoked = LimitedSet()
 
         mingle.start(c)
-        I.hello.assert_called_with(c.hostname, our_revoked._data)
+        I.hello.assert_called_with(
+            c.hostname, our_revoked._data,
+            revoked_stamps=c.controller.state.revoked_stamps.as_dict())
+        c.controller.state.revoked_stamps.update_from_dict.assert_called_with(
+            I.hello.return_value['A@example.com']['revoked_stamps'])
         c.app.clock.adjust.assert_has_calls([
             call(312), call(29),
         ], any_order=True)

@@ -819,6 +819,67 @@ class test_Request(RequestCase):
             assert job._already_revoked
             assert job.acknowledged
 
+    def test_revoked_by_stamped_headers_regex(self):
+        revoked_stamps.clear()
+        job = self.xRequest()
+        job._message.headers['stamps'] = {'tenant_id': 'tenant-42'}
+        job._message.headers['stamped_headers'] = ['tenant_id']
+        job._request_dict['stamps'] = {'tenant_id': 'tenant-42'}
+        job._request_dict['stamped_headers'] = ['tenant_id']
+        try:
+            revoked_stamps.add('tenant_id', 'tenant-.*', strategy='regex')
+            assert job.revoked()
+            assert job._already_revoked
+        finally:
+            revoked_stamps.clear()
+
+    def test_revoked_by_stamped_headers_regex_no_match(self):
+        revoked_stamps.clear()
+        job = self.xRequest()
+        job._message.headers['stamps'] = {'tenant_id': 'other-1'}
+        job._message.headers['stamped_headers'] = ['tenant_id']
+        job._request_dict['stamps'] = {'tenant_id': 'other-1'}
+        job._request_dict['stamped_headers'] = ['tenant_id']
+        try:
+            revoked_stamps.add('tenant_id', 'tenant-.*', strategy='regex')
+            assert not job.revoked()
+            assert not job._already_revoked
+        finally:
+            revoked_stamps.clear()
+
+    def test_revoked_by_stamped_headers_expired_revocation(self):
+        revoked_stamps.clear()
+        job = self.xRequest()
+        job._message.headers['stamps'] = {'tenant_id': 't-1'}
+        job._message.headers['stamped_headers'] = ['tenant_id']
+        job._request_dict['stamps'] = {'tenant_id': 't-1'}
+        job._request_dict['stamped_headers'] = ['tenant_id']
+        try:
+            revoked_stamps.add(
+                'tenant_id', 't-1', expires=10, now=time() - 100)
+            assert not job.revoked()
+            assert not job._already_revoked
+        finally:
+            revoked_stamps.clear()
+
+    def test_revoked_by_stamped_headers_not_announced_twice(self):
+        revoked_stamps.clear()
+        job = self.xRequest()
+        job._message.headers['stamps'] = {'tenant_id': 't-1'}
+        job._message.headers['stamped_headers'] = ['tenant_id']
+        job._request_dict['stamps'] = {'tenant_id': 't-1'}
+        job._request_dict['stamped_headers'] = ['tenant_id']
+        job.task.backend.mark_as_revoked = Mock(name='mark_as_revoked')
+        try:
+            revoked_stamps.add('tenant_id', 't-1')
+            assert job.revoked()
+            assert job.revoked()
+            assert job.revoked()
+            job.task.backend.mark_as_revoked.assert_called_once()
+            job._on_ack.assert_called_once()
+        finally:
+            revoked_stamps.clear()
+
     def test_execute_does_not_execute_revoked(self):
         job = self.xRequest()
         revoked.add(job.id)

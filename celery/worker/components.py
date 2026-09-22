@@ -13,7 +13,8 @@ from celery.exceptions import ImproperlyConfigured
 from celery.platforms import IS_WINDOWS
 from celery.utils.log import worker_logger as logger
 
-__all__ = ('Timer', 'Hub', 'Pool', 'Beat', 'StateDB', 'Consumer')
+__all__ = ('Timer', 'Hub', 'Pool', 'Beat', 'StateDB', 'RevocationStore',
+           'Consumer')
 
 GREEN_POOLS = {'eventlet', 'gevent'}
 
@@ -216,6 +217,43 @@ class StateDB(bootsteps.Step):
     def create(self, w):
         w._persistence = w.state.Persistent(w.state, w.statedb, w.app.clock)
         atexit.register(w._persistence.save)
+
+
+class RevocationStore(bootsteps.Step):
+    """Bootstep restoring persisted revoked stamped headers.
+
+    When :setting:`worker_revoked_stamps_store` selects a persistent
+    revocation store (e.g. ``backend``), the revoked stamped
+    headers stored there are merged into the worker state at startup, so
+    matching tasks are still rejected after a restart.  The store is
+    exposed as ``worker.revocation_store`` for the
+    ``revoke_by_stamped_headers`` control command to write
+    through to.
+    """
+
+    label = 'RevocationStore'
+
+    def __init__(self, w, **kwargs):
+        w.revocation_store = None
+        super().__init__(w, **kwargs)
+
+    def create(self, w):
+        from celery.worker.revocation import create_revocation_store
+        store = create_revocation_store(w.app)
+        w.revocation_store = store
+        if store is None:
+            return
+        try:
+            persisted = store.load()
+        except Exception as exc:
+            logger.warning(
+                'Failed to load revoked stamped headers from %r: %r',
+                store, exc)
+            return
+        if persisted:
+            w.state.revoked_stamps.merge(persisted)
+            logger.info(
+                'Restored revoked stamped headers from %s', store)
 
 
 class Consumer(bootsteps.StartStopStep):

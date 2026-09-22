@@ -387,8 +387,9 @@ class Inspect:
         """
         return self._request('conf', with_defaults=with_defaults)
 
-    def hello(self, from_node, revoked=None):
-        return self._request('hello', from_node=from_node, revoked=revoked)
+    def hello(self, from_node, revoked=None, revoked_stamps=None):
+        return self._request('hello', from_node=from_node, revoked=revoked,
+                             revoked_stamps=revoked_stamps)
 
     def memsample(self):
         """Return sample current RSS memory usage.
@@ -510,7 +511,8 @@ class Control:
         }, **kwargs)
 
     def revoke_by_stamped_headers(self, headers, destination=None, terminate=False,
-                                  signal=TERM_SIGNAME, **kwargs):
+                                  signal=TERM_SIGNAME, strategy=None, expires=None,
+                                  **kwargs):
         """
         Tell all (or specific) workers to revoke a task by headers.
 
@@ -523,15 +525,27 @@ class Control:
                 on the task (if any).
             signal (str): Name of signal to send to process if terminate.
                 Default is TERM.
+            strategy (str | dict): Stamp matching strategy: ``exact``
+                (default) or ``regex``.  A dictionary maps
+                individual header names to strategies.
+            expires (float): Seconds until the revocation expires and is
+                cleaned up.  Defaults to the worker's
+                :setting:`worker_revoked_stamps_expires` setting.
 
         See Also:
             :meth:`broadcast` for supported keyword arguments.
         """
-        result = self.broadcast('revoke_by_stamped_headers', destination=destination, arguments={
+        arguments = {
             'headers': headers,
             'terminate': terminate,
             'signal': signal,
-        }, **kwargs)
+        }
+        if strategy is not None:
+            arguments['strategy'] = strategy
+        if expires is not None:
+            arguments['expires'] = expires
+        result = self.broadcast('revoke_by_stamped_headers', destination=destination,
+                                arguments=arguments, **kwargs)
 
         task_ids = set()
         if result:

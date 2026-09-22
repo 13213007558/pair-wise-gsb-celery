@@ -21,7 +21,7 @@ from celery.concurrency.base import BasePool
 from celery.exceptions import (Ignore, InvalidTaskError, Reject, Retry, TaskRevokedError, Terminated,
                                TimeLimitExceeded, WorkerLostError)
 from celery.platforms import signals as _signals
-from celery.utils.functional import maybe, maybe_list, noop
+from celery.utils.functional import maybe, noop
 from celery.utils.log import get_logger
 from celery.utils.nodenames import gethostname
 from celery.utils.serialization import get_pickled_exception
@@ -484,24 +484,8 @@ class Request:
         revoked_by_header, revoking_header = False, None
 
         if not revoked_by_id and self.stamped_headers:
-            for stamp in self.stamped_headers:
-                if stamp in revoked_stamps:
-                    revoked_header = revoked_stamps[stamp]
-                    stamped_header = self._message.headers['stamps'][stamp]
-
-                    if isinstance(stamped_header, (list, tuple)):
-                        for stamped_value in stamped_header:
-                            if stamped_value in maybe_list(revoked_header):
-                                revoked_by_header = True
-                                revoking_header = {stamp: stamped_value}
-                                break
-                    else:
-                        revoked_by_header = any([
-                            stamped_header in maybe_list(revoked_header),
-                            stamped_header == revoked_header,  # When the header is a single set value
-                        ])
-                        revoking_header = {stamp: stamped_header}
-                    break
+            revoking_header = revoked_stamps.match(self.stamps)
+            revoked_by_header = revoking_header is not None
 
         if any((expired, revoked_by_id, revoked_by_header)):
             log_msg = 'Discarding revoked task: %s[%s]'
