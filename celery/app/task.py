@@ -910,6 +910,13 @@ class Task:
         else:
             parent_id = None
             root_id = task_id
+        # Explicit lineage options (e.g. frozen into a canvas signature,
+        # or passed by an eagerly evaluated chain/group) take
+        # precedence over the stack-derived defaults, so that eager
+        # canvas evaluation keeps the same root/parent lineage as the
+        # message-based path.
+        parent_id = options.pop('parent_id', None) or parent_id
+        root_id = options.pop('root_id', None) or root_id
 
         # Make sure we get the task instance, not class.
         task = app._tasks[self.name]

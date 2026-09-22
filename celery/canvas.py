@@ -342,6 +342,25 @@ class Signature(dict):
 
         if isinstance(task, dict):
             super().__init__(task)  # works like dict(d)
+            # Canvas preparation mutates the args/kwargs/options
+            # containers of a signature (freeze, link, stamping, ...).
+            # Give the signature its own copies of the mutable
+            # containers so those operations never write back into the
+            # caller's original dict/list structures.
+            sig_args = self.get('args')
+            if isinstance(sig_args, list):
+                self['args'] = list(sig_args)
+            sig_kwargs = self.get('kwargs')
+            if isinstance(sig_kwargs, dict):
+                self['kwargs'] = dict(sig_kwargs)
+            sig_options = self.get('options')
+            if isinstance(sig_options, dict):
+                self['options'] = sig_options = dict(sig_options)
+                # link()/link_error() extend these lists in place.
+                for list_key in ('link', 'link_error'):
+                    links = sig_options.get(list_key)
+                    if isinstance(links, list):
+                        sig_options[list_key] = list(links)
         else:
             # Also supports using task class/instance instead of string name.
             try:
@@ -968,8 +987,9 @@ class _chain(Signature):
     def from_dict(cls, d, app=None):
         tasks = d['kwargs']['tasks']
         if tasks:
-            if isinstance(tasks, tuple):  # aaaargh
-                tasks = d['kwargs']['tasks'] = list(tasks)
+            # Canonicalize into a new list: the caller's dict (e.g. a
+            # deserialized message or a reusable template) must never
+            # be written back to.
             tasks = [maybe_signature(task, app=app) for task in tasks]
         return cls(tasks, app=app, **d['options'])
 
@@ -1263,7 +1283,9 @@ class _chain(Signature):
                     task = task.clone(args, kwargs)
                 else:
                     task = task.clone()
-            elif is_first_task:
+            elif is_first_task and not task.immutable:
+                # In-place freeze (clone=False): the first task receives
+                # the chain's partial args, unless it is immutable.
                 task.args = tuple(args) + tuple(task.args)
 
             if isinstance(task, _chain):
@@ -1344,14 +1366,22 @@ class _chain(Signature):
                 while node.parent:
                     node = node.parent
                 prev_res = node
-        # Use the last task's actual ID, not the input parameter.
-        self.id = results[0].id if results else last_task_id
+        if not clone:
+            # Only record the frozen id on ourselves when finalizing in
+            # place (freeze).  When the chain is being dispatched
+            # (apply_async/run) the prepared tasks are clones, and
+            # storing their id here would pollute a reusable chain
+            # template with a concrete task id.
+            # Use the last task's actual ID, not the input parameter.
+            self.id = results[0].id if results else last_task_id
         return tasks, results
 
     def apply(self, args=None, kwargs=None, **options):
         args = args if args else ()
         kwargs = kwargs if kwargs else {}
         last, (fargs, fkwargs) = None, (args, kwargs)
+        root_id = options.get('root_id') or self.options.get('root_id')
+        parent_id = options.get('parent_id') or self.options.get('parent_id')
         tasks = list(self.tasks)
         for index, task in enumerate(tasks):
             if _is_empty_group(task) and (
@@ -1359,9 +1389,21 @@ class _chain(Signature):
                 # Skip empty groups, mirroring _chain.prepare_steps:
                 # an empty group is a no-op, unless it is the only task.
                 continue
+            task_options = dict(self.options, **options)
+            # Propagate trace lineage along the eagerly evaluated
+            # chain: every task after the first is parented to its
+            # predecessor and shares the chain's root id, matching the
+            # header inheritance of the message-based path.
+            if parent_id is not None:
+                task_options['parent_id'] = parent_id
+            if root_id is not None:
+                task_options['root_id'] = root_id
             res = task.clone().apply(
                 (last.get(),) if last else fargs, fkwargs,
-                **dict(self.options, **options))
+                **task_options)
+            parent_id = res.id
+            if root_id is None:
+                root_id = res.id
             res.parent, last, (fargs, fkwargs) = last, res, (None, None)
             if isinstance(res, EagerResult) and res.state in (IGNORED, REJECTED):
                 break
@@ -1633,12 +1675,11 @@ class group(Signature):
 
         The tasks themselves can be dictionaries or signatures (or both).
         """
-        # We need to mutate the `kwargs` element in place to avoid confusing
-        # `freeze()` implementations which end up here and expect to be able to
-        # access elements from that dictionary later and refer to objects
-        # canonicalized here
+        # Canonicalize the tasks into a new sequence of signatures without
+        # writing back into the caller's dict: the input may be a reusable
+        # template or a deserialized message that must stay intact.
         orig_tasks = d["kwargs"]["tasks"]
-        d["kwargs"]["tasks"] = rebuilt_tasks = type(orig_tasks)(
+        rebuilt_tasks = type(orig_tasks)(
             maybe_signature(task, app=app) for task in orig_tasks
         )
         return cls(rebuilt_tasks, app=app, **d['options'])
@@ -1651,12 +1692,40 @@ class group(Signature):
             if isinstance(tasks, abstract.CallableSignature):
                 tasks = [tasks.clone()]
             if not isinstance(tasks, _regen):
-                # May potentially cause slow downs when using a
-                # generator of many tasks - Issue #6973
-                tasks = regen(tasks)
+                if isinstance(tasks, (list, tuple)):
+                    # Copy concrete sequences so that in-place updates of
+                    # self.tasks (freeze, stamping, ...) never write back
+                    # into a list shared with the caller -- e.g. a chord
+                    # header list or a reusable group template.
+                    tasks = list(tasks)
+                else:
+                    # May potentially cause slow downs when using a
+                    # generator of many tasks - Issue #6973
+                    tasks = regen(tasks)
         super().__init__('celery.group', (), {'tasks': tasks}, **options
                          )
         self.subtask_type = 'group'
+
+    def clone(self, *args, **kwargs):
+        to_signature = maybe_signature
+        signature = super().clone(*args, **kwargs)
+        tasks = signature.kwargs['tasks']
+        if isinstance(tasks, _regen):
+            # Keep generator-backed groups lazy: clone each task as it
+            # is pulled from the (shared) iterator instead of
+            # exhausting it up front.
+            signature.kwargs['tasks'] = regen(
+                to_signature(task, app=self._app, clone=True)
+                for task in tasks
+            )
+        else:
+            # Clone the member tasks so that the cloned group never
+            # shares mutable signature objects with the original.
+            signature.kwargs['tasks'] = [
+                to_signature(task, app=self._app, clone=True)
+                for task in tasks
+            ]
+        return signature
 
     def __call__(self, *partial_args, **options):
         return self.apply_async(partial_args, **options)
@@ -2245,7 +2314,9 @@ class _chord(Signature):
                 return self.apply(args, kwargs,
                                   body=body, task_id=task_id, **options)
 
-        merged_options = dict(self.options, **options) if options else self.options
+        # Always work on a copy: the task_id pop below must never
+        # write back into the chord template's own options.
+        merged_options = dict(self.options, **options)
         option_task_id = merged_options.pop("task_id", None)
         if task_id is None:
             task_id = option_task_id
@@ -2327,7 +2398,10 @@ class _chord(Signature):
         app = app or self._get_app(body)
         group_id = header.options.get('task_id') or uuid()
         root_id = body.options.get('root_id')
-        options = dict(self.options, **options) if options else self.options
+        # Always merge into a fresh dict: the pops below (and the
+        # header dispatch) must never write back into the chord
+        # template's own options.
+        options = dict(self.options, **options)
         if options:
             options.pop('task_id', None)
             body.options.update(options)
