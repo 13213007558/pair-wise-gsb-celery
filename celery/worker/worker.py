@@ -13,11 +13,13 @@ The worker consists of several components, all managed by bootsteps
 """
 
 import os
+import threading
 import sys
 from datetime import datetime, timezone
-from time import sleep
+from time import monotonic, sleep
 
 from billiard import cpu_count
+from kombu.common import ignore_errors
 from kombu.utils.compat import detect_environment
 
 from celery import bootsteps
@@ -97,6 +99,9 @@ class WorkController:
         self.on_after_init(**kwargs)
 
         self.setup_instance(**self.prepare_args(**kwargs))
+        self._shutdown_lock = threading.RLock()
+        self._shutdown_phase = None
+        self._cold_shutdown_cancel = False
 
     def setup_instance(self, queues=None, ready_callback=None, pidfile=None,
                        include=None, use_eventloop=None, exclude_queues=None,
@@ -155,11 +160,15 @@ class WorkController:
         pass
 
     def on_close(self):
-        self.app.loader.shutdown_worker()
+        # Result-backend and loader resources are needed while pool callbacks
+        # and consumer acknowledgments drain. They are released in
+        # on_stopped(), after every worker bootstep has terminated.
+        pass
 
     def on_stopped(self):
         self.timer.stop()
         self.consumer.shutdown()
+        self.app.loader.shutdown_worker()
 
         if self.pidlock:
             self.pidlock.release()
@@ -245,25 +254,74 @@ class WorkController:
         """Graceful shutdown of the worker server (Warm shutdown)."""
         if exitcode is not None:
             self.exitcode = exitcode
-        if self.blueprint.state == RUN:
-            self.signal_consumer_close()
-            if not in_sighandler or self.pool.signal_safe:
-                self._shutdown(warm=True)
+        with self._shutdown_lock:
+            if self._shutdown_phase is None:
+                self._shutdown_phase = 'warm'
+            elif self._shutdown_phase not in (None, 'warm'):
+                return
+            if self.blueprint.state == RUN:
+                self.signal_consumer_close()
+                if not in_sighandler or self.pool.signal_safe:
+                    self._shutdown(warm=True)
         self._send_worker_shutdown()
 
     def terminate(self, in_sighandler=False):
         """Not so graceful shutdown of the worker server (Cold shutdown)."""
-        if self.blueprint.state != TERMINATE:
-            # Every cold path lands here, with or without on_cold_shutdown
-            # (WorkerTerminate raised by the consumer, embedded callers), so
-            # bound the broker socket before teardown reads from it.
-            consumer = getattr(self, 'consumer', None)
+        with self._shutdown_lock:
+            if self._shutdown_phase is None:
+                self._shutdown_phase = 'cold-immediate'
+            if self.blueprint.state != TERMINATE:
+                self.prepare_cold_shutdown()
+                if not in_sighandler or self.pool.signal_safe:
+                    self._shutdown(warm=False)
+
+    def request_cold_shutdown(self):
+        """Record a cold shutdown requested from outside the worker loop."""
+        with self._shutdown_lock:
+            if self._shutdown_phase in (None, 'warm', 'cold-soft'):
+                self._shutdown_phase = 'cold-soft'
+                self._cold_shutdown_cancel = False
+            else:
+                self._cold_shutdown_cancel = True
+
+    def force_cold_shutdown(self):
+        """Skip the remaining soft-shutdown drain."""
+        with self._shutdown_lock:
+            self._cold_shutdown_cancel = True
+
+    def schedule_cold_shutdown(self):
+        """Run cold shutdown from the green event loop, not a signal handler."""
+        consumer = getattr(self, 'consumer', None)
+        if consumer is not None and consumer.timer is not None:
+            consumer.timer.call_after(0.0, self.terminate)
+
+    def prepare_cold_shutdown(self):
+        """Stop intake and put accepted work in the pool's terminal state."""
+        consumer = getattr(self, 'consumer', None)
+        if consumer is None:
+            return
+
+        if self._shutdown_phase is None:
+            self._shutdown_phase = 'cold-immediate'
+
+        if self._shutdown_phase != 'cold-prepared':
+            soft_shutdown = self._shutdown_phase == 'cold-soft'
+            consumer.stop_accepting()
+            if soft_shutdown:
+                self.wait_for_soft_shutdown()
+            self._shutdown_phase = 'cold-preparing'
+
+            # Every cold path lands here, including WorkerTerminate raised
+            # by the consumer and embedded callers.
             connection = getattr(consumer, 'connection', None)
             if connection is not None:
                 bound_open_broker_sockets(connection, SHUTDOWN_SOCKET_TIMEOUT)
-            self.signal_consumer_close()
-            if not in_sighandler or self.pool.signal_safe:
-                self._shutdown(warm=False)
+
+            consumer.cancel_unfinished_requests(self.pool)
+            state.should_terminate = self.exitcode or True
+            self._shutdown_phase = 'cold-prepared'
+
+        self.signal_consumer_close()
 
     def _shutdown(self, warm=True):
         # if blueprint does not exist it means that we had an
@@ -453,4 +511,6 @@ class WorkController:
         if app.conf.worker_soft_shutdown_timeout > 0 and requests:
             log = f"Initiating Soft Shutdown, terminating in {app.conf.worker_soft_shutdown_timeout} seconds"
             logger.warning(log)
-            sleep(app.conf.worker_soft_shutdown_timeout)
+            deadline = monotonic() + app.conf.worker_soft_shutdown_timeout
+            while not self._cold_shutdown_cancel and monotonic() < deadline:
+                sleep(min(0.1, deadline - monotonic()))

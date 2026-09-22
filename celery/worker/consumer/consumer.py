@@ -499,6 +499,24 @@ class Consumer:
         self.perform_pending_operations()
         self.blueprint.shutdown(self)
 
+    def stop_accepting(self):
+        """Cancel broker intake and future scheduled work."""
+        if getattr(self, '_accepting_stopped', False):
+            return
+        self._accepting_stopped = True
+
+        task_consumer = getattr(self, 'task_consumer', None)
+        if task_consumer is not None:
+            ignore_errors(self, task_consumer.cancel)
+
+        for request in tuple(scheduled_requests):
+            entry = request._eta_timer_entry
+            if entry is not None and self.timer is not None:
+                try:
+                    self.timer.cancel(entry)
+                except Exception:
+                    logger.exception('Error cancelling ETA timer entry: %r', entry)
+
     def stop(self):
         self.blueprint.stop(self)
 
@@ -529,9 +547,23 @@ class Consumer:
         message.ack()
 
     def on_close(self):
-        # Clear internal queues to get rid of old messages.
-        # They can't be acked anyway, as a delivery tag is specific
-        # to the current channel.
+        # Warm shutdown keeps accepted work alive while the pool drains.
+        # Scheduled work is still broker-owned: once the consumer stops, the
+        # broker can redeliver it, so cancel its local timer entry here.
+        shutdown_phase = getattr(self.controller, '_shutdown_phase', None)
+        if shutdown_phase == 'warm':
+            for r in tuple(scheduled_requests):
+                entry = r._eta_timer_entry
+                if entry is not None and self.timer is not None:
+                    try:
+                        self.timer.cancel(entry)
+                    except Exception:
+                        logger.exception('Error cancelling ETA timer entry: %r', entry)
+            return
+
+        # Cold shutdown: clear internal queues. They can't be acked on the
+        # old delivery tag, and cancel_unfinished_requests() is responsible
+        # for messages still represented by a Request.
         if self.controller and self.controller.semaphore:
             self.controller.semaphore.clear()
         for bucket in self.task_buckets.values():
@@ -542,15 +574,6 @@ class Consumer:
                 requests.pop(r.id, None)
         reserved_requests.clear()
         reserved_requests.update(tuple(active_requests))
-        # Scheduled (ETA/countdown) requests never became reserved, so they
-        # aren't covered by the cleanup above. Cancel their pending timer
-        # entries (through self.timer.cancel(), not entry.cancel()
-        # directly, since e.g. the Eventlet timer relies on that to catch
-        # GreenletExit) so the callback can't fire after we've torn down
-        # this connection (the synloop error path doesn't clear the timer
-        # the way asynloop's hub.reset()/hub.timer.clear() does), then drop
-        # our copies since the broker may redeliver these tasks to another
-        # worker on reconnect.
         for r in tuple(scheduled_requests):
             entry = r._eta_timer_entry
             if entry is not None and self.timer is not None:
@@ -844,38 +867,30 @@ class Consumer:
             self=self, state=self.blueprint.human_state(),
         )
 
-    def cancel_active_requests(self):
-        """Cancel active requests during shutdown.
+    def cancel_unfinished_requests(self, pool=None):
+        """Cancel reserved and active requests during cold shutdown.
 
-        Cancels all active requests that either do not require late acknowledgments or,
-        if they do, have not been acknowledged yet.
-
-        Does not cancel successful tasks, even if they have not been acknowledged yet.
+        Warm shutdown never calls this method. Successful requests and
+        messages that are already acknowledged are left for their existing
+        # task callbacks to finish. Each Request cancels itself at most once,
+        # so repeated cold signals cannot duplicate terminal signals.
         """
+        pool = self.pool if pool is None else pool
 
-        def should_cancel(request):
-            if not request.task.acks_late:
-                # Task does not require late acknowledgment, cancel it.
-                return True
+        def unfinished(request):
+            if request.id in successful_requests or request.acknowledged:
+                return False
+            return request in active_requests or request in reserved_requests
 
-            if not request.acknowledged:
-                # Task is late acknowledged, but it has not been acknowledged yet, cancel it.
-                if request.id in successful_requests:
-                    # Unless it was successful, in which case we don't want to cancel it.
-                    return False
-                return True
-
-            # Task is late acknowledged, but it has already been acknowledged.
-            return False  # Do not cancel and allow it to gracefully finish as it has already been acknowledged.
-
-        requests_to_cancel = tuple(filter(should_cancel, active_requests))
-
-        if requests_to_cancel:
-            for request in requests_to_cancel:
-                # For acks_late tasks, don't emit RETRY signal since broker will handle redelivery
-                # For non-acks_late tasks, emit RETRY signal as usual
-                emit_retry = not request.task.acks_late
-                request.cancel(self.pool, emit_retry=emit_retry)
+        for request in tuple(state.requests.values()):
+            if unfinished(request):
+                try:
+                    request.cancel(pool, emit_retry=not request.task.acks_late)
+                except Exception:
+                    logger.exception(
+                        'Error cancelling request during shutdown: %r',
+                        request,
+                    )
 
 
 class Evloop(bootsteps.StartStopStep):

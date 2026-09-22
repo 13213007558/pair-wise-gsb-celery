@@ -113,6 +113,18 @@ class TaskPool(base.BasePool):
         if self._pool is not None:
             self._pool.join()
 
+    def on_terminate(self):
+        if self._pool_map is not None:
+            for greenlet in tuple(self._pool_map.values()):
+                try:
+                    greenlet.kill()
+                except Exception:
+                    base.logger.exception(
+                        'Error terminating gevent greenlet: %r', greenlet)
+            self._pool_map.clear()
+        if self._pool is not None:
+            self._pool.kill(block=False)
+
     def on_apply(self, target, args=None, kwargs=None, callback=None,
                  accept_callback=None, timeout=None,
                  timeout_callback=None, apply_target=apply_target, **_):

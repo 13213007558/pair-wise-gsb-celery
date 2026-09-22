@@ -15,7 +15,6 @@ from functools import partial
 
 from billiard.common import REMAP_SIGTERM
 from billiard.process import current_process
-from kombu.common import ignore_errors
 from kombu.utils.encoding import safe_str
 
 from celery import VERSION_BANNER, _original_os_write, platforms, signals
@@ -27,10 +26,8 @@ from celery.utils.debug import cry
 from celery.utils.imports import qualname
 from celery.utils.log import get_logger, in_sighandler, set_in_sighandler
 from celery.utils.text import pluralize
-from celery.utils.threads import bound_open_broker_sockets
 from celery.utils.time import humanize_seconds
 from celery.worker import WorkController
-from celery.worker.worker import SHUTDOWN_SOCKET_TIMEOUT
 
 __all__ = ('Worker',)
 
@@ -387,8 +384,9 @@ def during_soft_shutdown(worker: Worker):
     install_worker_term_hard_handler(worker, sig='SIGINT', callback=on_hard_shutdown, verbose=False)
     install_worker_term_hard_handler(worker, sig='SIGQUIT', callback=on_hard_shutdown)
 
-    # Cancel all unacked requests and allow the worker to terminate naturally
-    worker.consumer.cancel_active_requests()
+    # Move straight to cold cancellation without waiting for the remaining
+    # soft-shutdown timeout.
+    worker.force_cold_shutdown()
 
     # We get here if the worker was in the middle of the soft (cold) shutdown process,
     # and the matching signal was received. This can typically happen when the worker is
@@ -444,31 +442,15 @@ def on_cold_shutdown(worker: Worker):
         install_worker_term_hard_handler(worker, sig='SIGTERM', callback=during_soft_shutdown)
     # else, SIGTERM will print the _shutdown_handler's message and do nothing, every time it is received..
 
-    # Initiate soft shutdown process (if enabled and tasks are running)
-    worker.wait_for_soft_shutdown()
+    worker.request_cold_shutdown()
 
-    # Bound the broker socket before cancel(): on amqp that is a basic_cancel
-    # waiting for a reply a silent broker never sends (Issue 975).
-    # terminate() bounds again for cold paths that skip this handler; warm
-    # shutdown is deliberately left unbounded, see WorkController._shutdown.
-    connection = getattr(worker.consumer, 'connection', None)
-    if connection is not None:
-        bound_open_broker_sockets(connection, SHUTDOWN_SOCKET_TIMEOUT)
-
-    # Stop consuming new tasks to prevents requeued messages from being immediately redelivered.
-    # A bounded socket makes cancel() raise on a silent peer; that must not abort the shutdown.
-    if worker.consumer.task_consumer:
-        ignore_errors(worker.consumer, worker.consumer.task_consumer.cancel)
-
-    # Cancel all unacked requests and allow the worker to terminate naturally
-    worker.consumer.cancel_active_requests()
-
-    from celery.worker import state
-    state.should_terminate = True
-
-    # Stop the pool to allow successful tasks call on_success()
-    if worker.consumer.pool:
-        worker.consumer.pool.stop()
+    if getattr(worker.pool, 'signal_safe', True):
+        worker.terminate(in_sighandler=True)
+    else:
+        # Thread/green pools cannot run their blocking teardown from a signal
+        # handler. The event loop observes the flag immediately and invokes
+        # the same terminate path used by WorkerTerminate in prefork workers.
+        worker.schedule_cold_shutdown()
 
 
 # Allow SIGTERM to be remapped to SIGQUIT to initiate cold shutdown instead of warm shutdown using SIGTERM

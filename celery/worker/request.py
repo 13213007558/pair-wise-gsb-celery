@@ -432,10 +432,20 @@ class Request:
                 obj.terminate(signal)
 
     def cancel(self, pool, signal=None, emit_retry=True):
+        if self._already_cancelled or self._already_revoked:
+            return
         signal = _signals.signum(signal or TERM_SIGNAME)
+        self._already_cancelled = True
+        if not self.task.acks_late and not self.acknowledged:
+            self.reject(requeue=True)
         if self.time_start:
             pool.terminate_job(self.worker_pid, signal)
             self._announce_cancelled(emit_retry=emit_retry)
+        elif emit_retry:
+            # The request was accepted by the worker but never by the pool.
+            # Mark its terminal stage explicitly; simply dropping it would
+            # leave both observers and the result backend without a state.
+            self._announce_cancelled(emit_retry=True)
 
         if self._apply_result is not None:
             obj = self._apply_result()  # is a weakref
@@ -443,6 +453,8 @@ class Request:
                 obj.terminate(signal)
 
     def _announce_cancelled(self, emit_retry=True):
+        if self._already_revoked:
+            return
         task_ready(self)
         self.send_event('task-cancelled')
 
@@ -461,6 +473,8 @@ class Request:
             send_retry(self.task, request=self._context, einfo=None)
 
     def _announce_revoked(self, reason, terminated, signum, expired):
+        if self._already_revoked:
+            return
         task_ready(self)
         self.send_event('task-revoked',
                         terminated=terminated, signum=signum, expired=expired)
@@ -470,6 +484,7 @@ class Request:
         )
         self.acknowledge()
         self._already_revoked = True
+        self._already_cancelled = False
         send_revoked(self.task, request=self._context,
                      terminated=terminated, signum=signum, expired=expired)
 

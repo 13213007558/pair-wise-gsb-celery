@@ -120,6 +120,20 @@ class TaskPool(base.BasePool):
             self._pool.waitall()
         signals.eventlet_pool_postshutdown.send(sender=self)
 
+    def on_terminate(self):
+        if self._pool_map is not None:
+            for greenlet in tuple(self._pool_map.values()):
+                try:
+                    greenlet.kill()
+                    greenlet.wait()
+                except Exception:
+                    base.logger.exception(
+                        'Error terminating eventlet greenthread: %r',
+                        greenlet)
+            self._pool_map.clear()
+        if self._pool is not None:
+            self._pool.waitall()
+
     def on_apply(self, target, args=None, kwargs=None, callback=None,
                  accept_callback=None, **_):
         target = TaskPool._make_killable_target(target)
