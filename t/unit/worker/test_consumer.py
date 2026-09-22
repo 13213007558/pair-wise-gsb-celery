@@ -96,6 +96,16 @@ class test_Consumer(ConsumerTestCase):
     def test_taskbuckets_defaultdict(self):
         c = self.get_consumer()
         assert c.task_buckets['fooxasdwx.wewe'] is None
+        assert c.fair_rate_limiter is None
+
+    def test_fair_rate_limiter_is_opt_in(self):
+        self.add.rate_limit = '1/s'
+        self.app.conf.worker_rate_limit_scheduler = 'fair'
+        c = self.get_consumer()
+        assert c.fair_rate_limiter is not None
+        bucket = c.fair_rate_limiter.buckets[self.add.name]
+        c.reset_rate_limits()
+        assert c.fair_rate_limiter.buckets[self.add.name] is bucket
 
     def test_sets_heartbeat(self):
         c = self.get_consumer(amqheartbeat=10)

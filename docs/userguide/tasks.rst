@@ -1029,6 +1029,14 @@ General
     Default is the :setting:`task_default_rate_limit` setting:
     if not specified means rate limiting for tasks is disabled by default.
 
+.. attribute:: Task.rate_limit_scope
+
+    Optional explicit fair rate-limit scope. This is used only when
+    :setting:`worker_rate_limit_scheduler` is ``"fair"`` and is ignored by the
+    default legacy scheduler. A matching key in
+    :setting:`worker_rate_limit_scopes` supplies the bucket rate; otherwise
+    the scope is private to the task type.
+
     Note that this is a *per worker instance* rate limit, and not a global
     rate limit. To enforce a global rate limit (e.g., for an API with a
     maximum number of  requests per second), you must restrict to a given

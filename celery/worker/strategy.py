@@ -123,6 +123,7 @@ def default(task, app, consumer,
     handle = consumer.on_task_request
     limit_task = consumer._limit_task
     limit_post_eta = consumer._limit_post_eta
+    fair_limiter = getattr(consumer, 'fair_rate_limiter', None)
     Request = symbol_by_name(task.Request)
     Req = create_request_cls(Request, task, consumer.pool, hostname, eventer,
                              app=app)
@@ -187,7 +188,7 @@ def default(task, app, consumer,
                 error("Couldn't convert ETA %r to timestamp: %r. Task: %r",
                       req.eta, exc, req.info(safe=True), exc_info=True)
                 req.reject(requeue=False)
-        if rate_limits_enabled:
+        if rate_limits_enabled and fair_limiter is None:
             bucket = get_bucket(task.name)
 
         if eta and bucket:
@@ -202,6 +203,15 @@ def default(task, app, consumer,
             task_scheduled(req)
             return
 
+        if eta and rate_limits_enabled and fair_limiter is not None:
+            consumer.qos.increment_eventually()
+            task_scheduled(req)
+            fair_limiter.limit(
+                req, task, ready_at=eta, release_prefetch=True,
+                callbacks=callbacks,
+            )
+            return
+
         if eta:
             consumer.qos.increment_eventually()
             req._eta_timer_entry = call_at(
@@ -210,6 +220,9 @@ def default(task, app, consumer,
             return task_message_handler
         if bucket:
             return limit_task(req, bucket, 1)
+        if rate_limits_enabled and fair_limiter is not None:
+            fair_limiter.limit(req, task, callbacks=callbacks)
+            return
 
         task_reserved(req)
         if callbacks:

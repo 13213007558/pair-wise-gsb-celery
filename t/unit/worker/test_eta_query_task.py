@@ -13,6 +13,8 @@ import socket
 from collections import defaultdict
 from unittest.mock import Mock
 
+from celery.utils.collections import AttributeDict
+
 import pytest
 
 from celery.exceptions import TaskRevokedError
@@ -47,6 +49,7 @@ class _RealConsumer(consumer_module.Consumer):
         # whole test session. It already starts out empty.
         self.task_consumer = Mock()
         self.task_buckets = defaultdict(lambda: None)
+        self.fair_rate_limiter = None
         self.qos = Mock()
         self.on_task_request = Mock()
         self.disable_rate_limits = True
@@ -67,7 +70,7 @@ class test_query_task_eta_lifecycle:
         self.consumer = _RealConsumer(self.app)
         self.panel = self.app.control.mailbox.Node(
             hostname=hostname,
-            state=Mock(),
+            state=AttributeDict(consumer=self.consumer),
             handlers=control.Panel.data,
         )
 

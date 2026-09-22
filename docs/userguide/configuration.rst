@@ -3690,6 +3690,84 @@ Default: Disabled (rate limits enabled).
 
 Disable all rate limits, even if tasks has explicit rate limits set.
 
+.. setting:: worker_rate_limit_scheduler
+
+``worker_rate_limit_scheduler``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``"legacy"``.
+
+Set to ``"fair"`` to use the optional fair per-task rate limiter. The
+legacy limiter remains the default and preserves its existing token-bucket
+behavior.
+
+The fair scheduler uses the monotonic worker clock. Every admitted request
+reserves an immutable, monotonically increasing start time, so wall-clock
+adjustments cannot advance or rewind issued quota. A task with an ETA is
+admitted at the later of its ETA and the next available rate-limit slot.
+Requests issued by an application retry use their retry number as part of the
+reservation identity, so retries consume a new slot after their ETA.
+
+Tokens are per worker process. They survive dynamic ``reset_rate_limits``
+commands and consumer reconnection within that worker: configuration changes
+update refill rates without clearing the already issued next slot, and
+reconnection does not grant an additional burst. Worker restart intentionally
+starts with fresh local quota because there is no broker-coordinated token
+state.
+
+When a fair-limited message cannot run yet, it is held locally up to
+:setting:`worker_rate_limit_pending` messages for that scope. Once that
+bounded buffer is full, or when :setting:`worker_rate_limit_pause_queues` is
+enabled, the message is requeued and the source broker queue is paused until
+the reserved start time. This keeps over-limit traffic under broker prefetch
+control instead of allowing an unlimited local queue to grow. Because queue
+pausing is broker-level, task types that must not block one another should use
+dedicated queues.
+
+.. setting:: worker_rate_limit_burst
+
+``worker_rate_limit_burst``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``1``.
+
+Initial burst capacity used by the optional fair rate-limit scheduler. A
+value of ``1`` spreads starts as evenly as possible; larger values allow that
+many starts in the same refill interval.
+
+.. setting:: worker_rate_limit_pending
+
+``worker_rate_limit_pending``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``1``.
+
+Maximum number of messages retained locally for each fair rate-limit scope.
+Additional over-limit messages are requeued with broker backpressure.
+
+.. setting:: worker_rate_limit_pause_queues
+
+``worker_rate_limit_pause_queues``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: Enabled.
+
+Pause and resume the source broker queue for fair-limited messages. Disable
+this only when the broker/transport cannot cancel and resume consumers; in
+that mode the bounded local pending limit applies.
+
+.. setting:: worker_rate_limit_scopes
+
+``worker_rate_limit_scopes``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``{}``.
+
+Mapping of explicit scope names to rate-limit strings. A request may select
+one of these scopes with the ``rate_limit_scope`` message header, or a task
+may define ``rate_limit_scope``. All tasks and queues using the same scope
+share one bucket on a worker.
+
 .. setting:: worker_state_db
 
 ``worker_state_db``

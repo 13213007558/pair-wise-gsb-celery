@@ -225,6 +225,14 @@ def _revoke(state, task_ids, terminate=False, signal=None, **kwargs):
         request = requests_by_id.get(task_id)
         if request and request in worker_state.active_requests:
             continue
+        if request is not None:
+            try:
+                consumer = state['consumer']
+            except (KeyError, TypeError):
+                consumer = None
+            fair_limiter = getattr(consumer, 'fair_rate_limiter', None)
+            if fair_limiter is not None and fair_limiter.cancel(request):
+                request.revoked()
         # Tasks may override their backend.
         backend = request.task.backend if request else state.app.backend
         try:

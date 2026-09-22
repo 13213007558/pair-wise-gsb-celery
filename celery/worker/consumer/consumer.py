@@ -33,6 +33,7 @@ from celery.utils.text import truncate
 from celery.utils.threads import bound_open_broker_sockets
 from celery.utils.time import humanize_seconds, rate
 from celery.worker import loops
+from celery.worker.rate_limit import FairRateLimiter
 from celery.worker.state import (active_requests, maybe_shutdown, requests, reserved_requests, scheduled_requests,
                                  successful_requests, task_reserved)
 
@@ -224,10 +225,19 @@ class Consumer:
         # running consumers. See ``on_connection_error_after_connected``.
         self.qos_global = None
 
-        # this contains a tokenbucket for each task type by name, used for
-        # rate limits, or None if rate limits are disabled for that task.
+        self.rate_limit_scheduler = self.app.conf.worker_rate_limit_scheduler
+        self.fair_rate_limiter = None
         self.task_buckets = defaultdict(lambda: None)
-        self.reset_rate_limits()
+        if self.rate_limit_scheduler == 'fair':
+            self.fair_rate_limiter = FairRateLimiter(
+                self.app, self.timer, self._limit_move_to_pool,
+                max_pending=self.app.conf.worker_rate_limit_pending,
+                pause_queues=self.app.conf.worker_rate_limit_pause_queues,
+                burst=self.app.conf.worker_rate_limit_burst,
+            )
+            self.fair_rate_limiter.reset_rate_limits(self.app.tasks)
+        else:
+            self.reset_rate_limits()
 
         self.hub = hub
         if self.hub or getattr(self.pool, 'is_green', False):
@@ -299,6 +309,9 @@ class Consumer:
         return TokenBucket(limit, capacity=1) if limit else None
 
     def reset_rate_limits(self):
+        if self.fair_rate_limiter is not None:
+            self.fair_rate_limiter.reset_rate_limits(self.app.tasks)
+            return
         self.task_buckets.update(
             (n, self.bucket_for_task(t)) for n, t in self.app.tasks.items()
         )
@@ -534,9 +547,12 @@ class Consumer:
         # to the current channel.
         if self.controller and self.controller.semaphore:
             self.controller.semaphore.clear()
-        for bucket in self.task_buckets.values():
-            if bucket:
-                bucket.clear_pending()
+        if self.fair_rate_limiter is not None:
+            self.fair_rate_limiter.clear_pending()
+        else:
+            for bucket in self.task_buckets.values():
+                if bucket:
+                    bucket.clear_pending()
         for r in tuple(reserved_requests):
             if r not in active_requests:
                 requests.pop(r.id, None)

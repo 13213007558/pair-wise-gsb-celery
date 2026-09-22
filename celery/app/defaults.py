@@ -338,6 +338,11 @@ NAMESPACES = Namespace(
         disable_rate_limits=Option(
             False, type='bool', old={'celery_disable_rate_limits'},
         ),
+        rate_limit_scheduler=Option('legacy', type='string'),
+        rate_limit_burst=Option(1, type='float'),
+        rate_limit_pending=Option(1, type='int'),
+        rate_limit_pause_queues=Option(True, type='bool'),
+        rate_limit_scopes=Option({}, type='dict'),
         deduplicate_successful_tasks=Option(
             False, type='bool'
         ),

@@ -249,6 +249,9 @@ class Task:
     #: a minute),`'100/h'` (hundred tasks an hour)
     rate_limit = None
 
+    #: Optional explicit rate-limit scope. By default the task type is used.
+    rate_limit_scope = None
+
     #: If enabled the worker won't store task state and return values
     #: for this task.  Defaults to the :setting:`task_ignore_result`
     #: setting.

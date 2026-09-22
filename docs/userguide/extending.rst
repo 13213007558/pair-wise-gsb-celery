@@ -531,9 +531,14 @@ Attributes
 
     A :class:`~collections.defaultdict` used to look-up the rate limit for
     a task by type.
-    Entries in this dict may be None (for no limit) or a
-    :class:`~kombu.utils.limits.TokenBucket` instance implementing
-    ``consume(tokens)`` and ``expected_time(tokens)``.
+    With the default legacy scheduler, entries in this dict may be None
+    (for no limit) or a :class:`~kombu.utils.limits.TokenBucket` instance
+    implementing ``consume(tokens)`` and ``expected_time(tokens)``.
+
+    The optional ``worker_rate_limit_scheduler = "fair"`` setting uses
+    :class:`~celery.worker.rate_limit.FairRateLimiter` instead. That limiter
+    keeps immutable monotonic reservations and leaves excess messages in the
+    broker/consumer backpressure path.
 
     TokenBucket implements the `token bucket algorithm`_, but any algorithm
     may be used as long as it conforms to the same interface and defines the

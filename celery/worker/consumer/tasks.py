@@ -45,6 +45,8 @@ class Tasks(bootsteps.StartStopStep):
         c.task_consumer = c.app.amqp.TaskConsumer(
             c.connection, on_decode_error=c.on_decode_error,
         )
+        if c.fair_rate_limiter is not None:
+            c.fair_rate_limiter.bind_consumer(c)
 
         def set_prefetch_count(prefetch_count):
             return c.task_consumer.qos(

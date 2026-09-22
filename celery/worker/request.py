@@ -165,6 +165,7 @@ class Request:
         self._delivery_info = {
             'exchange': delivery_info.get('exchange'),
             'routing_key': delivery_info.get('routing_key'),
+            'consumer_tag': delivery_info.get('consumer_tag'),
             'priority': properties.get('priority'),
             'redelivered': delivery_info.get('redelivered', False),
         }

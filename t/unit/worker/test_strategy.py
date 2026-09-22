@@ -127,12 +127,14 @@ class test_default_strategy_proto2:
 
     @contextmanager
     def _context(self, sig,
-                 rate_limits=True, events=True, utc=True, limit=None):
+                 rate_limits=True, events=True, utc=True, limit=None,
+                 fair_limiter=None):
         assert sig.type.Strategy
         assert sig.type.Request
 
         reserved = Mock()
         consumer = Mock()
+        consumer.fair_rate_limiter = None
         # Create a proper mock for task_buckets that supports __getitem__
         task_buckets_mock = Mock()
         task_buckets_mock.__getitem__ = Mock(side_effect=lambda key: None)
@@ -144,6 +146,7 @@ class test_default_strategy_proto2:
             )
         consumer.controller.state.revoked = set()
         consumer.disable_rate_limits = not rate_limits
+        consumer.fair_rate_limiter = fair_limiter
         consumer.event_dispatcher.enabled = events
         s = sig.type.start_strategy(self.app, consumer, task_reserved=reserved)
         assert s
@@ -303,6 +306,16 @@ class test_default_strategy_proto2:
         with self._context(task, rate_limits=True, limit='1/m') as C:
             C()
             assert C.was_limited_with_eta()
+            C.consumer.qos.increment_eventually.assert_called_with()
+
+    def test_fair_rate_limited_with_eta(self):
+        task = self.add.s(2, 2).set(countdown=10)
+        limiter = Mock()
+        with self._context(task, rate_limits=True,
+                           fair_limiter=limiter) as C:
+            C()
+            limiter.limit.assert_called_once()
+            assert limiter.limit.call_args.kwargs['ready_at'] > 0
             C.consumer.qos.increment_eventually.assert_called_with()
 
     def test_when_rate_limited__limits_disabled(self):
