@@ -4,6 +4,7 @@ import re
 from contextlib import contextmanager
 from unittest.mock import ANY, MagicMock, Mock, call, patch, sentinel
 from uuid import UUID
+from datetime import timedelta
 
 import pytest
 from kombu.serialization import prepare_accept_content
@@ -13,9 +14,12 @@ import celery
 from celery import chord, group, signature, states, uuid
 from celery.app.task import Context, Task
 from celery.backends.base import (COMPRESSED_PAYLOAD_MAGIC, BaseBackend, DisabledBackend, KeyValueStoreBackend,
-                                  _create_chord_error_with_cause, _create_fake_task_request, _nulldict,
-                                  compress_payload, decompress_payload)
-from celery.exceptions import (BackendGetMetaError, BackendStoreError, ChordError, ImproperlyConfigured,
+                                  RESULT_KIND_CHORD, RESULT_KIND_GROUP, RESULT_KIND_PENDING,
+                                  RESULT_KIND_TASK, _create_chord_error_with_cause,
+                                  _create_fake_task_request, _nulldict, compress_payload,
+                                  decompress_payload)
+from celery.exceptions import (BackendCapabilityError, BackendGetMetaError,
+                               BackendStoreError, ChordError, ImproperlyConfigured,
                                SecurityError, TimeoutError)
 from celery.result import GroupResult, result_from_tuple
 from celery.utils import serialization
@@ -103,6 +107,28 @@ class test_Backend_interface:
         assert len(b4.accept) == 1
         assert list(b4.accept)[0] == 'application/x-yaml'
         assert prepare_accept_content(['yaml']) == b4.accept
+
+    def test_cleanup_without_scan_capability_degrades_by_default(self):
+        b1 = BaseBackend(self.app)
+        report = b1.cleanup()
+        assert report.degraded == ['unsupported_cleanup_scan']
+        assert report.next_cursor is None
+
+    def test_cleanup_without_scan_capability_raises_when_strict(self):
+        self.app.conf.result_backend_cleanup_strict = True
+        with pytest.raises(BackendCapabilityError, match='cleanup scans'):
+            BaseBackend(self.app).cleanup()
+
+    def test_atomic_update_requirement_raises_without_capability(self):
+        self.app.conf.result_backend_require_atomic_updates = True
+        backend = KeyValueStoreBackend(self.app)
+        with pytest.raises(BackendCapabilityError, match='atomic result'):
+            backend.store_result('task', None, states.PENDING)
+
+    def test_state_ttl_requires_backend_capability(self):
+        self.app.conf.result_ttls = {states.PENDING: 1}
+        with pytest.raises(BackendCapabilityError, match='state-specific TTL'):
+            KeyValueStoreBackend(self.app)
 
     def test_get_result_meta(self):
         b1 = BaseBackend(self.app)
@@ -459,6 +485,17 @@ class KVBackend(KeyValueStoreBackend):
         self.db.pop(key, None)
 
 
+class EnumeratingKVBackend(KVBackend):
+    supports_atomic_result_updates = True
+    supports_result_ttl = True
+    supports_manual_cleanup = True
+
+    def iter_cleanup_keys(self, cursor=None):
+        for key in sorted(self.db):
+            if cursor is None or bytes_to_str(key) > cursor:
+                yield key
+
+
 class CompressingKVBackend(KVBackend):
     supports_result_compression = True
 
@@ -615,6 +652,14 @@ class test_BaseBackend_dict:
         b.on_chord_part_return = Mock()
         b.mark_as_done('id', 10, request=request)
         b.on_chord_part_return.assert_called_with(request, states.SUCCESS, 10)
+
+    def test_mark_as_done_and_failure_respect_ignore_result(self):
+        b = EnumeratingKVBackend(app=self.app)
+        request = Context(ignore_result=True)
+        b.mark_as_done('done', 1, request=request)
+        b.mark_as_failure('failed', KeyError('x'), request=request)
+        assert not b.task_result_exists('done')
+        assert not b.task_result_exists('failed')
 
     def test_mark_as_failure__bound_errback_eager(self):
         b = BaseBackend(app=self.app)
@@ -1318,6 +1363,171 @@ class test_KeyValueStoreBackend:
         stored_meta = self.b.decode(self.b.get(self.b.get_key_for_task(tid)))
         assert stored_meta['status'] == states.SUCCESS
 
+    def test_state_specific_ttls_are_prepared(self):
+        app = copy.deepcopy(self.app)
+        app.conf.result_ttls = {
+            states.PENDING: 60,
+            states.STARTED: 70,
+            states.RETRY: 80,
+            states.SUCCESS: 90,
+            states.FAILURE: 100,
+            states.REVOKED: 110,
+            'group': 200,
+            'chord': 210,
+            'pending_body': 220,
+        }
+        b = EnumeratingKVBackend(app=app)
+        assert b.result_ttl_for(states.PENDING) == 60
+        assert b.result_ttl_for(states.STARTED) == 70
+        assert b.result_ttl_for(states.RETRY) == 80
+        assert b.result_ttl_for(states.SUCCESS) == 90
+        assert b.result_ttl_for(states.FAILURE) == 100
+        assert b.result_ttl_for(states.REVOKED) == 110
+        assert b.result_ttl_for('group') == 200
+        assert b.result_ttl_for('chord') == 210
+        assert b.result_ttl_for('pending_body') == 220
+
+    def test_pending_result_is_retained_until_its_ttl_expires(self):
+        app = copy.deepcopy(self.app)
+        app.conf.result_ttls = {states.PENDING: 60, states.SUCCESS: 10}
+        b = EnumeratingKVBackend(app=app)
+        current = app.now()
+        with patch.object(app, 'now', return_value=current):
+            b.store_result('pending-task', None, states.PENDING)
+            b.store_result('done-task', 1, states.SUCCESS)
+        with patch.object(app, 'now', return_value=current + timedelta(seconds=11)):
+            report = b.cleanup()
+        assert report.deleted[RESULT_KIND_TASK] == 1
+        assert b.task_result_exists('pending-task')
+        assert not b.task_result_exists('done-task')
+        with patch.object(app, 'now', return_value=current + timedelta(seconds=61)):
+            report = b.cleanup()
+        assert not b.task_result_exists('pending-task')
+
+    def test_child_result_uses_children_ttl(self):
+        app = copy.deepcopy(self.app)
+        app.conf.result_ttls = {
+            states.SUCCESS: 10,
+            'children': 40,
+        }
+        b = EnumeratingKVBackend(app=app)
+        now = app.now()
+        with patch.object(app, 'now', return_value=now):
+            request = Context(parent_id=uuid())
+            b.store_result('child', 1, states.SUCCESS, request=request)
+            b.store_result('regular', 2, states.SUCCESS)
+        with patch.object(app, 'now', return_value=now + timedelta(seconds=11)):
+            report = b.cleanup()
+        assert b.task_result_exists('child')
+        assert not b.task_result_exists('regular')
+        assert report.retained[RESULT_KIND_TASK] >= 1
+
+    def test_ready_body_makes_pending_reference_orphan(self):
+        app = copy.deepcopy(self.app)
+        app.conf.result_ttls = {'pending_body': None, states.SUCCESS: 10}
+        b = EnumeratingKVBackend(app=app)
+        gid = uuid()
+        body_id = uuid()
+        callback = signature('add', task_id=body_id)
+        b.save_pending_body_reference(gid, callback, [])
+        b.mark_as_done(body_id, None)
+        report = b.cleanup()
+        assert report.deleted[RESULT_KIND_PENDING] == 1
+        assert report.events[0].reason == 'orphaned_pending_reference'
+
+    def test_cleanup_reports_kind_reason_and_is_repeatable(self):
+        app = copy.deepcopy(self.app)
+        app.conf.result_ttls = {
+            states.SUCCESS: 10,
+            'group': 20,
+            'pending_body': 30,
+        }
+        b = EnumeratingKVBackend(app=app)
+        now = app.now()
+        with patch.object(app, 'now', return_value=now):
+            tid = uuid()
+            gid = uuid()
+            body_task = uuid()
+            b.mark_as_done(tid, 'task')
+            app.GroupResult(gid, [app.AsyncResult(tid, backend=b)]).save(backend=b)
+            callback = signature('add', task_id=body_task)
+            b.save_pending_body_reference(gid, callback, [tid])
+        with patch.object(app, 'now', return_value=now + timedelta(seconds=11)):
+            first = b.cleanup()
+            second = b.cleanup()
+        assert first.deleted[RESULT_KIND_TASK] == 0
+        assert first.deleted[RESULT_KIND_GROUP] == 0
+        assert first.deleted[RESULT_KIND_PENDING] == 0
+        assert second.deleted == {
+            RESULT_KIND_TASK: 0,
+            RESULT_KIND_GROUP: 0,
+            RESULT_KIND_CHORD: 0,
+            RESULT_KIND_PENDING: 0,
+        }
+        assert b.task_result_exists(tid)
+        with patch.object(app, 'now', return_value=now + timedelta(seconds=21)):
+            report = b.cleanup(batch_size=1)
+        assert report.deleted[RESULT_KIND_GROUP] == 1
+        assert b.task_result_exists(tid)
+        assert report.next_cursor is not None
+        event = next(event for event in report.events
+                      if event.kind == RESULT_KIND_GROUP)
+        assert event.reason == 'ttl_expired'
+        assert event.ttl == 20
+        with patch.object(app, 'now', return_value=now + timedelta(seconds=31)):
+            report = b.cleanup()
+        assert report.deleted[RESULT_KIND_PENDING] == 1
+        assert report.deleted[RESULT_KIND_TASK] == 0
+        with patch.object(app, 'now', return_value=now + timedelta(seconds=31)):
+            report = b.cleanup()
+        assert report.deleted[RESULT_KIND_TASK] == 1
+        assert report.events
+        assert not b.cleanup().events
+
+    def test_children_keep_result_referenced(self):
+        app = copy.deepcopy(self.app)
+        app.conf.result_ttls = {states.SUCCESS: 10}
+        b = EnumeratingKVBackend(app=app)
+        now = app.now()
+        child_id = uuid()
+        with patch.object(app, 'now', return_value=now):
+            b.mark_as_done(child_id, 'child')
+            request = Context()
+            request.children.append(app.AsyncResult(child_id, backend=b))
+            b.store_result(uuid(), 'parent', states.SUCCESS, request=request)
+        with patch.object(app, 'now', return_value=now + timedelta(seconds=11)):
+            report = b.cleanup()
+        assert b.task_result_exists(child_id)
+        assert report.retained[RESULT_KIND_TASK] >= 1
+
+    def test_cleanup_does_not_delete_result_rewritten_after_expiry_check(self):
+        app = copy.deepcopy(self.app)
+        app.conf.result_ttls = {states.STARTED: 10, states.FAILURE: 10}
+        b = EnumeratingKVBackend(app=app)
+        now = app.now()
+        tid = uuid()
+        with patch.object(app, 'now', return_value=now):
+            b.store_result(tid, None, states.STARTED)
+        old_key = b.get_key_for_task(tid)
+        old_record = b.decode(b.get(old_key))
+        with patch.object(app, 'now', return_value=now + timedelta(seconds=11)):
+            b.mark_as_failure(tid, KeyError('new'))
+            assert not b._delete_result_if_unchanged(
+                old_key, old_record['version'], old_record['status'])
+            report = b.cleanup()
+        assert isinstance(b.get_result(tid), KeyError)
+        assert report.deleted[RESULT_KIND_TASK] == 0
+
+    def test_retry_can_follow_started_but_failure_wins(self):
+        tid = uuid()
+        self.b.store_result(tid, None, states.STARTED)
+        self.b.store_result(tid, KeyError('retry'), states.RETRY)
+        assert self.b.get_state(tid) == states.RETRY
+        self.b.store_result(tid, KeyError('failed'), states.FAILURE)
+        assert self.b.get_state(tid) == states.FAILURE
+        self.b.store_result(tid, None, states.RETRY)
+        assert self.b.get_state(tid) == states.FAILURE
+
     def test_get_key_for_task_none_task_id(self):
         with pytest.raises(ValueError):
             self.b.get_key_for_task(None)
@@ -1847,7 +2057,8 @@ class test_KeyValueStoreBackend_interface:
             KeyValueStoreBackend(self.app).incr('a')
 
     def test_cleanup(self):
-        assert not KeyValueStoreBackend(self.app).cleanup()
+        report = KeyValueStoreBackend(self.app).cleanup()
+        assert report.degraded == ['unsupported_cleanup_scan']
 
     def test_delete(self):
         with pytest.raises(NotImplementedError):

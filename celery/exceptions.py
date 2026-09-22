@@ -83,7 +83,8 @@ __all__ = (
     'InvalidTaskError', 'ChordError',
 
     # Backend related errors.
-    'BackendError', 'BackendGetMetaError', 'BackendStoreError',
+    'BackendCapabilityError', 'BackendError', 'BackendGetMetaError',
+    'BackendStoreError',
 
     # Billiard task errors.
     'SoftTimeLimitExceeded', 'TimeLimitExceeded',
@@ -287,6 +288,10 @@ class WorkerShutdown(SystemExit):
 
 class BackendError(Exception):
     """An issue writing or reading to/from the backend."""
+
+
+class BackendCapabilityError(BackendError):
+    """The backend cannot provide a requested result-store capability."""
 
 
 class BackendGetMetaError(BackendError):

@@ -9,8 +9,11 @@ import sys
 import time
 import warnings
 from collections import deque, namedtuple
+from collections.abc import Mapping
 from datetime import timedelta
 from functools import partial
+from threading import RLock
+from uuid import uuid4
 from uuid import UUID
 from weakref import WeakValueDictionary
 
@@ -27,8 +30,9 @@ import celery.exceptions
 from celery import current_app, group, maybe_signature, states
 from celery._state import get_current_task
 from celery.app.task import Context
-from celery.exceptions import (BackendGetMetaError, BackendStoreError, ChordError, ImproperlyConfigured,
-                               NotRegistered, SecurityError, TaskRevokedError, TimeoutError)
+from celery.exceptions import (BackendCapabilityError, BackendGetMetaError, BackendStoreError,
+                               ChordError, ImproperlyConfigured, NotRegistered, SecurityError,
+                               TaskRevokedError, TimeoutError)
 from celery.result import GroupResult, ResultBase, ResultSet, allow_join_result, result_from_tuple
 from celery.utils.collections import BufferMap
 from celery.utils.functional import LRUCache, arity_greater
@@ -38,6 +42,24 @@ from celery.utils.serialization import (create_exception_cls, ensure_serializabl
 from celery.utils.time import get_exponential_backoff_interval
 
 __all__ = ('BaseBackend', 'KeyValueStoreBackend', 'DisabledBackend')
+
+RESULT_KIND_TASK = 'result'
+RESULT_KIND_GROUP = 'group'
+RESULT_KIND_CHORD = 'chord'
+RESULT_KIND_PENDING = 'pending'
+
+PENDING_REF_SUFFIX = '.pending-body'
+CHORD_COUNTER_SUFFIXES = frozenset({'.j', '.l', '.t', '.s'})
+
+CLEANUP_REASON_TTL = 'ttl_expired'
+CLEANUP_REASON_ORPHAN = 'orphaned_pending_reference'
+
+RESULT_KIND_KEYS = (
+    RESULT_KIND_TASK,
+    RESULT_KIND_GROUP,
+    RESULT_KIND_CHORD,
+    RESULT_KIND_PENDING,
+)
 
 EXCEPTION_ABLE_CODECS = frozenset({'pickle'})
 
@@ -62,6 +84,9 @@ MESSAGE_BUFFER_MAX = 8192
 
 pending_results_t = namedtuple('pending_results_t', (
     'concrete', 'weak',
+))
+cleanup_event_t = namedtuple('cleanup_event_t', (
+    'kind', 'key', 'reason', 'ttl', 'age', 'status', 'cursor',
 ))
 
 E_NO_BACKEND = """
@@ -171,6 +196,45 @@ def _is_request_ignore_result(request):
     return request.ignore_result
 
 
+def _coerce_ttl(value):
+    if value is None:
+        return None
+    if isinstance(value, timedelta):
+        value = value.total_seconds()
+    value = float(value)
+    if value < 0:
+        raise ValueError('result TTL must not be negative')
+    return None if value == 0 else value
+
+
+class CleanupReport:
+    """Serializable report returned by an idempotent backend cleanup."""
+
+    def __init__(self, deleted=None, retained=None, events=None,
+                 cursor=None, next_cursor=None, degraded=None, errors=None):
+        self.deleted = dict(deleted or {})
+        self.retained = dict(retained or {})
+        self.events = list(events or [])
+        self.cursor = cursor
+        self.next_cursor = next_cursor
+        self.degraded = list(degraded or [])
+        self.errors = list(errors or [])
+
+    def __bool__(self):
+        return True
+
+    def as_dict(self):
+        return {
+            'deleted': self.deleted,
+            'retained': self.retained,
+            'events': [event._asdict() for event in self.events],
+            'cursor': self.cursor,
+            'next_cursor': self.next_cursor,
+            'degraded': self.degraded,
+            'errors': self.errors,
+        }
+
+
 class Backend:
     READY_STATES = states.READY_STATES
     UNREADY_STATES = states.UNREADY_STATES
@@ -201,6 +265,13 @@ class Backend:
     #: :setting:`result_compression` setting is ignored for them.
     supports_result_compression = False
 
+    supports_result_ttl = False
+    supports_atomic_result_updates = False
+    supports_result_cleanup_scan = False
+    supports_manual_cleanup = False
+    supports_conditional_delete = False
+    cleanup_batch_size = 500
+
     retry_policy = {
         'max_retries': 20,
         'interval_start': 0,
@@ -223,6 +294,9 @@ class Backend:
         self._cache = _nulldict() if cmax == -1 else LRUCache(limit=cmax)
 
         self.expires = self.prepare_expires(expires, expires_type)
+        self.result_ttls = self.prepare_result_ttls(conf.get('result_ttls'))
+        self.cleanup_batch_size = conf.get(
+            'result_backend_cleanup_batch_size', self.cleanup_batch_size)
 
         # precedence: accept, conf.result_accept_content, conf.accept_content
         self.accept = conf.result_accept_content if accept is None else accept
@@ -238,6 +312,8 @@ class Backend:
         self._pending_results = pending_results_t({}, WeakValueDictionary())
         self._pending_messages = BufferMap(MESSAGE_BUFFER_MAX)
         self.url = url
+        self._state_lock = RLock()
+        self._check_result_backend_capabilities()
 
     def as_uri(self, include_password=False):
         """Return the backend as an URI, sanitizing the password or not."""
@@ -255,7 +331,7 @@ class Backend:
     def mark_as_done(self, task_id, result,
                      request=None, store_result=True, state=states.SUCCESS):
         """Mark task as successfully executed."""
-        if (store_result and not _is_request_ignore_result(request)):
+        if self._should_store_result(store_result, request):
             self.store_result(task_id, result, state, request=request)
         if request and request.chord:
             self.on_chord_part_return(request, state, result)
@@ -265,7 +341,7 @@ class Backend:
                         store_result=True, call_errbacks=True,
                         state=states.FAILURE):
         """Mark task as executed with failure."""
-        if store_result:
+        if self._should_store_result(store_result, request):
             self.store_result(task_id, exc, state,
                               traceback=traceback, request=request)
         if request:
@@ -381,7 +457,7 @@ class Backend:
     def mark_as_revoked(self, task_id, reason='',
                         request=None, store_result=True, state=states.REVOKED):
         exc = TaskRevokedError(reason)
-        if store_result:
+        if self._should_store_result(store_result, request):
             self.store_result(task_id, exc, state,
                               traceback=None, request=request)
         if request and request.chord:
@@ -394,8 +470,9 @@ class Backend:
         Note:
             Stores the current exception (if any).
         """
-        return self.store_result(task_id, exc, state,
-                                 traceback=traceback, request=request)
+        if self._should_store_result(store_result, request):
+            return self.store_result(task_id, exc, state,
+                                     traceback=traceback, request=request)
 
     def chord_error_from_stack(self, callback, exc=None):
         app = self.app
@@ -669,6 +746,116 @@ class Backend:
             return type(value)
         return value
 
+    def prepare_result_ttls(self, configured=None):
+        default = _coerce_ttl(self.expires)
+        longer_default = (
+            None if default is None
+            else max(default, 7 * 24 * 60 * 60.0)
+        )
+        ttls = {
+            states.PENDING: None,
+            states.STARTED: None,
+            states.RETRY: None,
+            states.SUCCESS: default,
+            states.FAILURE: default,
+            states.REVOKED: default,
+            'children': default,
+            'group': longer_default,
+            'chord': longer_default,
+            'pending_body': longer_default,
+        }
+        configured = configured or {}
+        if not isinstance(configured, dict):
+            raise ImproperlyConfigured('result_ttls must be a dictionary')
+        for key, value in configured.items():
+            if key not in ttls:
+                raise ImproperlyConfigured(f'Unknown result TTL key: {key!r}')
+            ttls[key] = _coerce_ttl(value)
+        return ttls
+
+    def result_ttl_for(self, state_or_kind):
+        return self.result_ttls.get(state_or_kind, self.expires)
+
+    def _should_store_result(self, store_result, request=None):
+        return store_result and not _is_request_ignore_result(request)
+
+    def _new_result_version(self):
+        return uuid4().hex
+
+    def _current_time(self):
+        return self.app.now()
+
+    def _isoformat(self, value):
+        return value.isoformat()
+
+    def _parse_datetime(self, value):
+        if isinstance(value, str):
+            try:
+                from dateutil.parser import parse as parse_date
+
+                return parse_date(value)
+            except (ImportError, ValueError, OverflowError):
+                return None
+        return value
+
+    def _meta_updated_at(self, meta):
+        value = meta.get('updated_at') or meta.get('date_done')
+        parsed = self._parse_datetime(value)
+        return parsed if hasattr(parsed, 'timestamp') else None
+
+    def _meta_ttl(self, meta, kind=RESULT_KIND_TASK):
+        if kind == RESULT_KIND_GROUP:
+            return meta.get('ttl', self.result_ttl_for('group'))
+        if kind == RESULT_KIND_CHORD:
+            return meta.get('ttl', self.result_ttl_for('chord'))
+        if kind == RESULT_KIND_PENDING:
+            return meta.get('ttl', self.result_ttl_for('pending_body'))
+        state = meta.get('status')
+        return meta.get('ttl', self.result_ttl_for(state))
+
+    def _is_meta_expired(self, meta, kind=RESULT_KIND_TASK, now=None):
+        updated_at = self._meta_updated_at(meta)
+        ttl = self._meta_ttl(meta, kind)
+        if updated_at is None or ttl is None:
+            return False, None, None
+        now = now or self._current_time()
+        age = (now - updated_at).total_seconds()
+        return age >= ttl, ttl, age
+
+    def _state_can_replace(self, current_state, new_state):
+        if current_state in (None, states.PENDING):
+            return True
+        if current_state == states.SUCCESS:
+            return False
+        if new_state in (states.PENDING, states.RECEIVED):
+            return False
+        if current_state in self.READY_STATES:
+            return new_state in self.READY_STATES and \
+                states.precedence(new_state) <= states.precedence(current_state)
+        if new_state == states.RETRY:
+            return current_state in (states.STARTED, states.RECEIVED, states.RETRY)
+        if new_state == states.STARTED:
+            return current_state in (states.RECEIVED, states.STARTED)
+        return states.precedence(new_state) <= states.precedence(current_state)
+
+    def _check_result_backend_capabilities(self):
+        conf = self.app.conf
+        configured_ttls = conf.get('result_ttls')
+        if configured_ttls is not None and not self.supports_result_ttl:
+            raise BackendCapabilityError(
+                f'{type(self).__name__} does not support state-specific TTL')
+        if conf.get('result_backend_cleanup_strict') and \
+                not self.supports_result_cleanup_scan and \
+                not self.supports_autoexpire:
+            raise BackendCapabilityError(
+                f'{type(self).__name__} does not support result cleanup scans')
+
+    def require_atomic_result_updates(self):
+        if self.app.conf.get('result_backend_require_atomic_updates') and \
+                not self.supports_atomic_result_updates:
+            raise BackendCapabilityError(
+                f'{type(self).__name__} does not support atomic result updates')
+
     def prepare_persistent(self, enabled=None):
         if enabled is not None:
             return enabled
@@ -685,9 +872,10 @@ class Backend:
 
     def _get_result_meta(self, result,
                          state, traceback, request, format_date=True,
-                         encode=False):
+                         encode=False, version=None, updated_at=None, ttl=None):
+        updated_at = updated_at or self.app.now()
         if state in self.READY_STATES:
-            date_done = self.app.now()
+            date_done = updated_at
             if format_date:
                 date_done = date_done.isoformat()
         else:
@@ -699,6 +887,9 @@ class Backend:
             'traceback': traceback,
             'children': self.current_task_children(request),
             'date_done': date_done,
+            'version': version,
+            'updated_at': self._isoformat(updated_at) if format_date else updated_at,
+            'ttl': ttl,
         }
 
         if request and getattr(request, 'group', None):
@@ -922,8 +1113,35 @@ class Backend:
         self._cache.pop(group_id, None)
         return self._ensure_retryable(self._delete_group, group_id=group_id)
 
-    def cleanup(self):
-        """Backend cleanup."""
+    def cleanup(self, cursor=None, batch_size=None):
+        """Delete expired backend data.
+
+        Backends that cannot enumerate their stored keys must either override
+        this method or return a degraded report rather than guessing.
+        """
+        if self.supports_autoexpire:
+            return CleanupReport(
+                cursor=cursor,
+                next_cursor=cursor,
+                degraded=['native_autoexpire'],
+            )
+        if self.app.conf.get('result_backend_cleanup_strict'):
+            raise BackendCapabilityError(
+                f'{type(self).__name__} does not support result cleanup scans')
+        return CleanupReport(
+            cursor=cursor,
+            next_cursor=cursor,
+            degraded=['unsupported_cleanup_scan'],
+        )
+
+    def save_pending_body_reference(self, chord_id, body, result_ids=None,
+                                    ttl=None):
+        """Store a reference that keeps pending chord work reachable."""
+        return None
+
+    def delete_pending_body_reference(self, chord_id):
+        """Delete a pending chord body reference."""
+        return None
 
     def process_cleanup(self):
         """Cleanup actions to do at the end of a task worker process."""
@@ -990,6 +1208,11 @@ class Backend:
     def apply_chord(self, header_result_args, body, **kwargs):
         self.ensure_chords_allowed()
         header_result = self.app.GroupResult(*header_result_args)
+        self.save_pending_body_reference(
+            header_result.id,
+            body,
+            [result.id for result in header_result.results],
+        )
         self.fallback_chord_unlock(header_result, body, **kwargs)
 
     def current_task_children(self, request=None):
@@ -1097,6 +1320,10 @@ class BaseKeyValueStoreBackend(Backend):
     group_keyprefix = 'celery-taskset-meta-'
     chord_keyprefix = 'chord-unlock-'
     implements_incr = False
+    supports_result_ttl = False
+    supports_conditional_delete = True
+    supports_manual_cleanup = False
+    atomic_store_attempts = 3
 
     def __init__(self, *args, **kwargs):
         if hasattr(self.key_t, '__func__'):  # pragma: no cover
@@ -1134,7 +1361,7 @@ class BaseKeyValueStoreBackend(Backend):
         raise NotImplementedError('Does not support get_many')
 
     def _set_with_state(self, key, value, state):
-        return self.set(key, value)
+        self.set(key, value)
 
     def set(self, key, value):
         raise NotImplementedError('Must implement the set method.')
@@ -1259,35 +1486,117 @@ class BaseKeyValueStoreBackend(Backend):
 
     def _store_result(self, task_id, result, state,
                       traceback=None, request=None, **kwargs):
-        meta = self._get_result_meta(result=result, state=state,
-                                     traceback=traceback, request=request)
-        meta['task_id'] = bytes_to_str(task_id)
+        self.require_atomic_result_updates()
+        key = self.get_key_for_task(task_id)
+        for _ in range(self.atomic_store_attempts):
+            current_payload = self.get(key)
+            current_meta = self._get_task_meta_for(task_id)
+            current_version = current_meta.get('version')
+            if not self._state_can_replace(current_meta.get('status'), state):
+                return result
 
-        # Retrieve metadata from the backend, if the status
-        # is a success then we ignore any following update to the state.
-        # This solves a task deduplication issue because of network
-        # partitioning or lost workers. This issue involved a race condition
-        # making a lost task overwrite the last successful result in the
-        # result backend.
-        current_meta = self._get_task_meta_for(task_id)
+            ttl_key = (
+                'children'
+                if request and getattr(request, 'parent_id', None)
+                else state
+            )
+            ttl = self.result_ttl_for(ttl_key)
+            version = self._new_result_version()
+            meta = self._get_result_meta(
+                result=result,
+                state=state,
+                traceback=traceback,
+                request=request,
+                version=version,
+                ttl=ttl,
+            )
+            meta['task_id'] = bytes_to_str(task_id)
+            payload = self.encode(meta)
 
-        if current_meta['status'] == states.SUCCESS:
-            return result
+            try:
+                stored = self._compare_and_set_result(
+                    key=key,
+                    payload=payload,
+                    state=state,
+                    expected_version=current_version,
+                    expected_status=current_meta.get('status'),
+                    ttl=ttl,
+                    expected_payload=current_payload,
+                )
+            except BackendStoreError as ex:
+                raise BackendStoreError(
+                    str(ex), state=state, task_id=task_id) from ex
+            if stored:
+                return result
+        raise BackendStoreError(
+            'failed to store result after conflicting retries',
+            state=state, task_id=task_id,
+        )
 
-        try:
-            self._set_with_state(self.get_key_for_task(task_id), self.encode(meta), state)
-        except BackendStoreError as ex:
-            raise BackendStoreError(str(ex), state=state, task_id=task_id) from ex
-
-        return result
+    def _compare_and_set_result(self, key, payload, state, expected_version,
+                                expected_status, ttl=None,
+                                expected_payload=None):
+        with self._state_lock:
+            task_id = bytes_to_str(key[len(self.task_keyprefix):])
+            if self.get(key) != expected_payload:
+                return False
+            current_meta = self._get_task_meta_for(task_id)
+            current_version = current_meta.get('version')
+            current_status = current_meta.get('status')
+            if current_version != expected_version or current_status != expected_status:
+                return False
+            self._set_with_state(key, payload, state)
+            if ttl:
+                self.expire(key, ttl)
+            return True
 
     def _save_group(self, group_id, result):
-        self._set_with_state(self.get_key_for_group(group_id),
-                             self.encode({'result': result.as_tuple()}), states.SUCCESS)
+        version = self._new_result_version()
+        updated_at = self._current_time()
+        ttl = self.result_ttl_for('group')
+        meta = {
+            'result': result.as_tuple(),
+            'version': version,
+            'updated_at': self._isoformat(updated_at),
+            'ttl': ttl,
+            'kind': RESULT_KIND_GROUP,
+        }
+        self._set_with_state(
+            self.get_key_for_group(group_id),
+            self.encode(meta), states.SUCCESS,
+        )
+        if ttl:
+            self.expire(self.get_key_for_group(group_id), ttl)
         return result
 
     def _delete_group(self, group_id):
         self.delete(self.get_key_for_group(group_id))
+
+    def save_pending_body_reference(self, chord_id, body, result_ids=None,
+                                    ttl=None):
+        if body is None:
+            return None
+        body_data = dict(body) if isinstance(body, Mapping) else body
+        ttl = ttl if ttl is not None else self.result_ttl_for('pending_body')
+        payload = {
+            'kind': RESULT_KIND_PENDING,
+            'version': self._new_result_version(),
+            'updated_at': self._isoformat(self._current_time()),
+            'ttl': ttl,
+            'chord_id': chord_id,
+            'body': body_data,
+            'result_ids': list(result_ids or []),
+        }
+        self._set_with_state(
+            self.get_key_for_group(chord_id, PENDING_REF_SUFFIX),
+            self.encode(payload), states.PENDING,
+        )
+        if ttl:
+            self.expire(self.get_key_for_group(chord_id, PENDING_REF_SUFFIX), ttl)
+        return payload
+
+    def delete_pending_body_reference(self, chord_id):
+        self.delete(self.get_key_for_group(chord_id, PENDING_REF_SUFFIX))
 
     def _get_task_meta_for(self, task_id):
         """Get task meta-data for a task by id."""
@@ -1323,6 +1632,235 @@ class BaseKeyValueStoreBackend(Backend):
             result = meta['result']
             meta['result'] = result_from_tuple(result, self.app)
             return meta
+
+    def iter_cleanup_keys(self, cursor=None):
+        raise NotImplementedError('backend does not support key enumeration')
+
+    def _classify_cleanup_key(self, key):
+        text_key = bytes_to_str(key)
+        task_prefix = bytes_to_str(self.task_keyprefix)
+        group_prefix = bytes_to_str(self.group_keyprefix)
+        chord_prefix = bytes_to_str(self.chord_keyprefix)
+        if text_key.startswith(task_prefix) and not text_key.endswith('.v'):
+            return RESULT_KIND_TASK
+        if text_key.startswith(group_prefix):
+            if text_key.endswith(PENDING_REF_SUFFIX):
+                return RESULT_KIND_PENDING
+            if any(text_key.endswith(suffix) for suffix in CHORD_COUNTER_SUFFIXES):
+                return RESULT_KIND_CHORD
+            return RESULT_KIND_GROUP
+        if text_key.startswith(chord_prefix):
+            return RESULT_KIND_CHORD
+        return None
+
+    def _decode_cleanup_record(self, key, kind):
+        value = self.get(key)
+        if not value:
+            return None
+        if kind in (RESULT_KIND_GROUP, RESULT_KIND_PENDING):
+            return self.decode(value)
+        if kind == RESULT_KIND_CHORD:
+            text_key = bytes_to_str(key)
+            updated_at = None
+            ttl = self.result_ttl_for('chord')
+            if text_key.endswith(('.j', '.l')):
+                try:
+                    self.decode(value)
+                except Exception:
+                    pass
+            return {
+                'kind': RESULT_KIND_CHORD,
+                'updated_at': updated_at,
+                'ttl': ttl,
+            }
+        return self.decode_result(value)
+
+    @staticmethod
+    def _collect_record_references(record, kind):
+        references = set()
+        if not isinstance(record, dict):
+            return references
+
+        if kind == RESULT_KIND_PENDING:
+            references.update(str(item) for item in record.get('result_ids', ()))
+            body = record.get('body')
+            if isinstance(body, Mapping):
+                options = body.get('options') or {}
+                body_id = options.get('task_id')
+                if body_id:
+                    references.add(str(body_id))
+            return references
+
+        if kind == RESULT_KIND_TASK:
+            for child in record.get('children') or ():
+                BaseKeyValueStoreBackend._collect_tuple_references(child, references)
+            return references
+
+        if kind != RESULT_KIND_GROUP:
+            return references
+        result = record.get('result')
+        if not isinstance(result, (list, tuple)) or len(result) < 2:
+            return references
+        tasks = result[1] or ()
+        for task in tasks:
+            BaseKeyValueStoreBackend._collect_tuple_references(task, references)
+        return references
+
+    @staticmethod
+    def _collect_tuple_references(node, references):
+        if isinstance(node, (list, tuple)):
+            if (
+                len(node) == 2 and
+                isinstance(node[0], (list, tuple)) and node[0] and
+                isinstance(node[0][0], str) and node[1] is None
+            ):
+                references.add(node[0][0])
+            for child in node:
+                BaseKeyValueStoreBackend._collect_tuple_references(
+                    child, references)
+
+    def _cleanup_delete(self, key, kind, record, event):
+        if kind in (RESULT_KIND_GROUP, RESULT_KIND_PENDING):
+            return self._delete_key_if_version(key, record.get('version'))
+        if kind == RESULT_KIND_TASK:
+            expected_payload = self.get(key)
+            return self._delete_result_if_unchanged(
+                key, record.get('version'), record.get('status'),
+                expected_payload=expected_payload)
+        self.delete(key)
+        return True
+
+    def _delete_result_if_unchanged(self, key, version, status,
+                                    expected_payload=None):
+        with self._state_lock:
+            if self.get(key) != expected_payload:
+                return False
+            meta = self._get_task_meta_for(
+                bytes_to_str(key[len(self.task_keyprefix):]))
+            if meta.get('version') != version or meta.get('status') != status:
+                return False
+            self.delete(key)
+            return True
+
+    def _delete_key_if_version(self, key, version):
+        value = self.get(key)
+        if not value:
+            return True
+        if self.decode(value).get('version') != version:
+            return False
+        self.delete(key)
+        return True
+
+    def cleanup(self, cursor=None, batch_size=None):
+        if self.supports_autoexpire and not self.supports_manual_cleanup:
+            return CleanupReport(
+                cursor=cursor, next_cursor=cursor,
+                degraded=['native_autoexpire'])
+        try:
+            all_keys = list(self.iter_cleanup_keys())
+        except NotImplementedError:
+            if self.app.conf.get('result_backend_cleanup_strict'):
+                raise BackendCapabilityError(
+                    f'{type(self).__name__} does not support result cleanup scans')
+            return CleanupReport(
+                cursor=cursor, next_cursor=cursor,
+                degraded=['unsupported_cleanup_scan'])
+
+        batch_size = int(batch_size or self.cleanup_batch_size)
+        now = self._current_time()
+        report = CleanupReport(cursor=cursor)
+        for kind in RESULT_KIND_KEYS:
+            report.deleted[kind] = 0
+            report.retained[kind] = 0
+
+        indexed_records = []
+        referenced = set()
+        start_index = 0
+        if cursor is not None:
+            start_index = next(
+                (index for index, key in enumerate(all_keys)
+                 if bytes_to_str(key) > cursor),
+                len(all_keys),
+            )
+
+        for key in all_keys:
+            kind = self._classify_cleanup_key(key)
+            if kind in (RESULT_KIND_TASK, RESULT_KIND_GROUP,
+                        RESULT_KIND_PENDING):
+                record = self._decode_cleanup_record(key, kind)
+                if record is not None:
+                    referenced.update(
+                        self._collect_record_references(record, kind))
+        if cursor is None:
+            for key in all_keys:
+                kind = self._classify_cleanup_key(key)
+                if kind in (RESULT_KIND_GROUP, RESULT_KIND_PENDING):
+                    record = self._decode_cleanup_record(key, kind)
+                    if record is not None:
+                        self._cleanup_record(
+                            key, kind, record, referenced, now, None, report)
+        for index, key in enumerate(all_keys):
+            kind = self._classify_cleanup_key(key)
+            if kind is None:
+                continue
+            record = self._decode_cleanup_record(key, kind)
+            if record is None:
+                continue
+            if index < start_index:
+                continue
+            indexed_records.append((index, key, kind, record))
+        batch = indexed_records[:batch_size]
+        for index, key, kind, record in batch:
+            if kind == RESULT_KIND_TASK:
+                self._cleanup_record(
+                    key, kind, record, referenced, now, None, report)
+
+        if batch:
+            report.next_cursor = bytes_to_str(batch[-1][1])
+            last_index = batch[-1][0]
+            if len(batch) < batch_size or last_index >= len(all_keys) - 1:
+                report.next_cursor = None
+        else:
+            report.next_cursor = None
+        return report
+
+    def _cleanup_record(self, key, kind, record, referenced, now,
+                        cursor, report):
+        status = record.get('status')
+        expired, ttl, age = self._is_meta_expired(record, kind, now)
+        text_key = bytes_to_str(key)
+        if kind == RESULT_KIND_TASK:
+            identifier = text_key[len(bytes_to_str(self.task_keyprefix)):]
+            if identifier in referenced:
+                report.retained[kind] += 1
+                return
+        reason = CLEANUP_REASON_TTL
+        if kind == RESULT_KIND_PENDING and not expired:
+            body = record.get('body')
+            body_options = body.get('options', {}) if isinstance(body, Mapping) else {}
+            body_id = body_options.get('task_id')
+            if body_id:
+                body_meta = self._get_task_meta_for(body_id)
+                if body_meta.get('status') in self.READY_STATES:
+                    reason = CLEANUP_REASON_ORPHAN
+                else:
+                    report.retained[kind] += 1
+                    return
+            else:
+                report.retained[kind] += 1
+                return
+        if not expired and reason == CLEANUP_REASON_TTL:
+            report.retained[kind] += 1
+            return
+        event = cleanup_event_t(
+            kind=kind, key=text_key, reason=reason,
+            ttl=ttl, age=age, status=status, cursor=cursor,
+        )
+        if self._cleanup_delete(key, kind, record, event):
+            report.events.append(event)
+            report.deleted[kind] += 1
+        else:
+            report.retained[kind] += 1
 
     def _apply_chord_incr(self, header_result_args, body, **kwargs):
         self.ensure_chords_allowed()
@@ -1393,6 +1931,8 @@ class BaseKeyValueStoreBackend(Backend):
                         message=f'Callback error: {exc!r}', original_exc=exc
                     )
                     self.chord_error_from_stack(callback=callback, exc=chord_error)
+                else:
+                    self.delete_pending_body_reference(gid)
             finally:
                 deps.delete()
                 self.delete(key)

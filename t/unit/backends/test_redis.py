@@ -121,6 +121,49 @@ class Redis(conftest.MockCallbacks):
     def delete(self, key):
         return bool(self.keyspace.pop(key, None))
 
+    def eval(self, script, numkeys, *args):
+        if numkeys != 2:
+            raise AssertionError('expected two script keys')
+        key, version_key = args[:2]
+        if 'DEL' in script:
+            if numkeys == 1:
+                expected_payload = args[2]
+                if key not in self.keyspace or (expected_payload and
+                                                self.keyspace[key] != expected_payload):
+                    return 0
+                self.keyspace.pop(key, None)
+                self.keyspace.pop(version_key, None)
+                return 1
+            expected_version = args[2]
+            if self.keyspace.get(version_key) != expected_version:
+                return 0
+            self.keyspace.pop(key, None)
+            self.keyspace.pop(version_key, None)
+            return 1
+        payload, expected_version, milliseconds = args[2:5]
+        next_version, expected_payload = args[5:7]
+        milliseconds = int(milliseconds)
+        current_version = self.keyspace.get(version_key)
+        if expected_version:
+            if current_version != expected_version:
+                return 0
+        elif current_version is not None or key in self.keyspace:
+            return 0
+        if key in self.keyspace and self.keyspace[key] != (expected_payload or None):
+            return 0
+        self.keyspace[key] = payload
+        self.keyspace[version_key] = next_version
+        if milliseconds:
+            self.expiry[key] = milliseconds / 1000
+            self.expiry[version_key] = milliseconds / 1000
+        return 1
+
+    def scan_iter(self, match=None, count=None):
+        prefix = match[:-1] if match and match.endswith(b'*') else match
+        for key in sorted(self.keyspace):
+            if prefix is None or key.startswith(prefix):
+                yield key
+
     def pipeline(self):
         return self.Pipeline(self)
 

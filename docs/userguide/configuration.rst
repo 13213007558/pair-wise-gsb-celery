@@ -159,6 +159,7 @@ For a complete Django example, see :ref:`django-first-steps`.
 ``CELERY_RESULT_EXCHANGE``                 :setting:`result_exchange`
 ``CELERY_RESULT_EXCHANGE_TYPE``            :setting:`result_exchange_type`
 ``CELERY_RESULT_EXPIRES``                  :setting:`result_expires`
+``CELERY_RESULT_TTLS``                     :setting:`result_ttls`
 ``CELERY_RESULT_PERSISTENT``               :setting:`result_persistent`
 ``CELERY_RESULT_SERIALIZER``               :setting:`result_serializer`
 ``CELERY_RESULT_DBURI``                    Use :setting:`result_backend` instead.
@@ -1032,6 +1033,30 @@ enabled. The task runs daily at 4am.
 
 A value of :const:`None` or 0 means results will never expire (depending
 on backend specifications).
+
+.. setting:: result_ttls
+
+``result_ttls``
+~~~~~~~~~~~~~~
+
+Default: Uses :setting:`result_expires` for ready and child results,
+keeps ``PENDING``, ``STARTED`` and ``RETRY`` results indefinitely, and
+keeps group/chord metadata and pending chord-body references for seven days.
+
+A mapping of per-state or per-result-type TTL values in seconds or
+:class:`~datetime.timedelta` objects. Accepted keys are ``PENDING``,
+``STARTED``, ``RETRY``, ``SUCCESS``, ``FAILURE``, ``REVOKED``,
+``children``, ``group``, ``chord`` and ``pending_body``. ``None`` or 0
+means the corresponding data is retained until explicitly removed.
+
+Backends without state-specific TTL, enumeration, or conditional update
+support return a degraded cleanup report, or raise a backend capability
+error when the corresponding strict setting is enabled.
+
+``result_backend_require_atomic_updates`` fails result writes on backends
+that cannot conditionally update a result. ``result_backend_cleanup_strict``
+makes cleanup fail instead of reporting an unsupported scan, and
+``result_backend_cleanup_batch_size`` limits result records per batch.
 
 .. note::
 

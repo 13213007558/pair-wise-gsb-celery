@@ -267,8 +267,12 @@ class Scheduler:
 
     def install_default_entries(self, data):
         entries = {}
-        if self.app.conf.result_expires and \
-                not self.app.backend.supports_autoexpire:
+        backend_type = type(self.app.backend)
+        uses_manual_cleanup = backend_type.__dict__.get(
+            'supports_manual_cleanup', False)
+        if self.app.conf.result_expires and (
+                not self.app.backend.supports_autoexpire or
+                uses_manual_cleanup):
             if 'celery.backend_cleanup' not in data:
                 entries['celery.backend_cleanup'] = {
                     'task': 'celery.backend_cleanup',

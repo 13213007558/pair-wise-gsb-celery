@@ -99,6 +99,7 @@ def add_unlock_chord_task(app):
         else:
             try:
                 callback.delay(ret)
+                app.backend.delete_pending_body_reference(group_id)
             except Exception as exc:  # pylint: disable=broad-except
                 logger.exception('Chord %r raised: %r', group_id, exc)
                 chord_error = _create_chord_error_with_cause(message=f'Callback error: {exc!r}', original_exc=exc)

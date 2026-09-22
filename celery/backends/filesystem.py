@@ -3,7 +3,7 @@ import locale
 import os
 from datetime import datetime
 
-from kombu.utils.encoding import ensure_bytes
+from kombu.utils.encoding import bytes_to_str, ensure_bytes
 
 from celery import uuid
 from celery.backends.base import KeyValueStoreBackend
@@ -35,6 +35,9 @@ class FilesystemBackend(KeyValueStoreBackend):
 
     # Result files are opened in binary mode in both directions.
     supports_result_compression = True
+    supports_result_ttl = True
+    supports_result_cleanup_scan = True
+    supports_manual_cleanup = True
 
     def __init__(self, url=None, open=open, unlink=os.unlink, sep=os.sep,
                  encoding=default_encoding, *args, **kwargs):
@@ -98,18 +101,24 @@ class FilesystemBackend(KeyValueStoreBackend):
     def delete(self, key):
         self.unlink(self._filename(key))
 
-    def cleanup(self):
-        """Delete expired meta-data."""
+    def iter_cleanup_keys(self, cursor=None):
+        for filename in sorted(os.listdir(self.path)):
+            if cursor is None or filename > cursor:
+                yield filename
+
+    def cleanup(self, cursor=None, batch_size=None):
+        """Delete expired metadata using filesystem modification time."""
         if not self.expires:
             return
         epoch = datetime(1970, 1, 1, tzinfo=self.app.timezone)
         now_ts = (self.app.now() - epoch).total_seconds()
         cutoff_ts = now_ts - self.expires
-        for filename in os.listdir(self.path):
+        for key in self.iter_cleanup_keys(cursor):
             for prefix in (self.task_keyprefix, self.group_keyprefix,
                            self.chord_keyprefix):
-                if filename.startswith(prefix):
-                    path = os.path.join(self.path, filename)
+                filename = bytes_to_str(key)
+                if filename.startswith(bytes_to_str(prefix)):
+                    path = self._filename(key)
                     if os.stat(path).st_mtime < cutoff_ts:
                         self.unlink(path)
                     break

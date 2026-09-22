@@ -6,6 +6,7 @@ from ssl import CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED
 from urllib.parse import unquote
 
 from kombu.utils import symbol_by_name
+from kombu.utils.encoding import bytes_to_str
 from kombu.utils.functional import retry_over_time
 from kombu.utils.objects import cached_property
 from kombu.utils.url import _parse_url, maybe_sanitize_url
@@ -226,6 +227,10 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
 
     supports_autoexpire = True
     supports_native_join = True
+    supports_atomic_result_updates = True
+    supports_result_ttl = True
+    supports_result_cleanup_scan = True
+    supports_manual_cleanup = True
     # Redis preserves binary payloads; response decoding disables compression.
     supports_result_compression = True
 
@@ -551,7 +556,99 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
             pipe.publish(key, value)
             pipe.execute()
 
+    def _set_with_state(self, key, value, state, ttl=None):
+        with self.client.pipeline() as pipe:
+            if ttl:
+                pipe.setex(key, int(ttl), value)
+            else:
+                pipe.set(key, value)
+            pipe.publish(key, value)
+            pipe.execute()
+
+    def _version_key(self, key):
+        return key + b'.v' if isinstance(key, bytes) else key + '.v'
+
+    def _compare_and_set_result(self, key, payload, state, expected_version,
+                                expected_status, ttl=None,
+                                expected_payload=None):
+        version_key = self._version_key(key)
+        if expected_version is None:
+            script = """
+            local current = redis.call('GET', KEYS[1])
+            local missing = (current == false)
+            if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
+            if (not missing) and current ~= ARGV[5] then return 0 end
+            redis.call('SET', KEYS[2], ARGV[2])
+            if tonumber(ARGV[3]) > 0 then
+                redis.call('PEXPIRE', KEYS[2], ARGV[3])
+            end
+            if tonumber(ARGV[3]) > 0 then
+                redis.call('PSETEX', KEYS[1], ARGV[3], ARGV[1])
+            else
+                redis.call('SET', KEYS[1], ARGV[1])
+            end
+            redis.call('PUBLISH', KEYS[1], ARGV[1])
+            return 1
+            """
+        else:
+            script = """
+            if redis.call('GET', KEYS[2]) ~= ARGV[2] then return 0 end
+            local next_version = ARGV[4]
+            redis.call('SET', KEYS[2], next_version)
+            if tonumber(ARGV[3]) > 0 then
+                redis.call('PEXPIRE', KEYS[2], ARGV[3])
+            else
+                redis.call('PERSIST', KEYS[2])
+            end
+            if tonumber(ARGV[3]) > 0 then
+                redis.call('PSETEX', KEYS[1], ARGV[3], ARGV[1])
+            else
+                redis.call('SET', KEYS[1], ARGV[1])
+            end
+            redis.call('PUBLISH', KEYS[1], ARGV[1])
+            return 1
+            """
+        milliseconds = int(float(ttl or 0) * 1000)
+        next_version = self._new_result_version()
+        result = self.client.eval(
+            script, 2, key, version_key,
+            payload, str(expected_version or ''), milliseconds, next_version,
+            expected_payload or '',
+        )
+        return bool(result)
+
+    def _delete_result_if_unchanged(self, key, version, status,
+                                    expected_payload=None):
+        if version is None:
+            script = """
+            if redis.call('STRLEN', KEYS[1]) == 0 then return 0 end
+            if ARGV[1] ~= '' and redis.call('GET', KEYS[1]) ~= ARGV[1] then
+                return 0
+            end
+            return redis.call('DEL', KEYS[1], KEYS[2])
+            """
+            return bool(self.client.eval(script, 1, key, expected_payload or ''))
+        script = """
+        if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end
+        redis.call('DEL', KEYS[1], KEYS[2])
+        return 1
+        """
+        return bool(self.client.eval(
+            script, 2, key, self._version_key(key), version))
+
+    def iter_cleanup_keys(self, cursor=None):
+        for prefix in (self.task_keyprefix, self.group_keyprefix,
+                       self.chord_keyprefix):
+            pattern = (
+                prefix + b'*' if isinstance(prefix, bytes)
+                else prefix + '*'
+            )
+            for key in self.client.scan_iter(match=pattern):
+                if not bytes_to_str(key).endswith('.v'):
+                    yield key
+
     def forget(self, task_id):
+        self.client.delete(self._version_key(self.get_key_for_task(task_id)))
         super().forget(task_id)
         self.result_consumer.cancel_for(task_id)
 
@@ -594,6 +691,12 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
             header_result = self.app.GroupResult(*header_result_args)
             if any(isinstance(nr, GroupResult) for nr in header_result.results):
                 header_result.save(backend=self)
+        if body is not None:
+            self.save_pending_body_reference(
+                header_result_args[0],
+                body,
+                [result.id for result in header_result_args[1]],
+            )
 
     @cached_property
     def _chord_zset(self):
@@ -624,11 +727,12 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
                 if self._chord_zset
                 else pipe.rpush(jkey, encoded).llen(jkey)
             ).get(tkey).get(skey)
-            if self.expires:
+            chord_ttl = self.result_ttl_for('chord')
+            if chord_ttl:
                 pipeline = pipeline \
-                    .expire(jkey, self.expires) \
-                    .expire(tkey, self.expires) \
-                    .expire(skey, self.expires)
+                    .expire(jkey, int(chord_ttl)) \
+                    .expire(tkey, int(chord_ttl)) \
+                    .expire(skey, int(chord_ttl))
 
             _, readycount, totaldiff, chord_size_bytes = pipeline.execute()[:4]
 
@@ -681,6 +785,8 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
                             callback,
                             ChordError(f'Callback error: {exc!r}'),
                         )
+                    else:
+                        self.delete_pending_body_reference(gid)
                     finally:
                         with client.pipeline() as pipe:
                             pipe \
