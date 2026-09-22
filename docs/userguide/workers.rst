@@ -674,11 +674,19 @@ This command is similar to :meth:`~@control.revoke`, but instead of
 specifying the task id(s), you specify the stamped header(s) as key-value pair(s),
 and each task that has a stamped header matching the key-value pair(s) will be revoked.
 
-.. warning::
+By default the rule is kept only in worker memory. Set
+:setting:`worker_revoke_by_stamped_headers_persistent` to ``True`` to store
+the rule in the Redis result backend. Persistent rules are loaded before a
+worker starts consuming messages, so a matching prefetched, queued, ETA,
+retry, link, or error message is also rejected after every worker in the
+cluster restarts. Rules apply globally to every queue consumed by the worker.
 
-    The revoked headers mapping is not persistent across restarts, so if you
-    restart the workers, the revoked headers will be lost and need to be
-    mapped again.
+Persistent rules expire after
+:setting:`worker_revoke_by_stamped_headers_expires` seconds, and retained
+rules are bounded by :setting:`worker_revoke_by_stamped_headers_max` to avoid
+unbounded growth. A specific revocation can use ``expires_in`` (relative
+seconds) or ``expires`` (absolute UNIX timestamp). Matching supports
+``match='exact'`` (the default) and ``match='regex'``.
 
 .. warning::
 
@@ -695,6 +703,11 @@ and each task that has a stamped header matching the key-value pair(s) will be r
     >>> app.control.revoke_by_stamped_headers({'header': 'value'}, terminate=True)
 
     >>> app.control.revoke_by_stamped_headers({'header': 'value'}, terminate=True, signal='SIGKILL')
+
+    >>> app.control.revoke_by_stamped_headers(
+    ...     {'tenant_id': 'tenant-1', 'deployment_id': 'deploy-1'},
+    ...     match='exact', expires_in=3600,
+    ... )
 
 
 Revoking multiple tasks by stamped headers
@@ -714,8 +727,10 @@ by several headers or several values.
     ...    'header_B': ['value_2', 'value_3'],
     })
 
-This will revoke all of the tasks that have a stamped header ``header_A`` with value ``value_1``,
-and all of the tasks that have a stamped header ``header_B`` with values ``value_2`` or ``value_3``.
+When several stamped header names are supplied, every named header must
+match. Multiple values for one header are alternatives. In the example below,
+a task must carry both ``header_A=value_1`` and ``header_B`` set to either
+``value_2`` or ``value_3``.
 
 **CLI Example**
 

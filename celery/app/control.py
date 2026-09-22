@@ -11,6 +11,7 @@ There are two types of remote control commands:
 * Control commands: Performs side effects, like adding a new queue to consume from.
   Commands are accessible via :class:`Control` class.
 """
+import time
 import warnings
 
 from billiard.common import TERM_SIGNAME
@@ -23,6 +24,7 @@ from kombu.utils.objects import cached_property
 from celery.exceptions import DuplicateNodenameWarning, ImproperlyConfigured
 from celery.utils.log import get_logger
 from celery.utils.text import pluralize
+from celery.worker.revocation import RevocationRule, get_persistent_revocation_backend
 
 __all__ = ('Inspect', 'Control', 'flatten_reply')
 
@@ -387,8 +389,11 @@ class Inspect:
         """
         return self._request('conf', with_defaults=with_defaults)
 
-    def hello(self, from_node, revoked=None):
-        return self._request('hello', from_node=from_node, revoked=revoked)
+    def hello(self, from_node, revoked=None, revoked_stamp_rules=None):
+        arguments = {'from_node': from_node, 'revoked': revoked}
+        if revoked_stamp_rules is not None:
+            arguments['revoked_stamp_rules'] = revoked_stamp_rules
+        return self._request('hello', **arguments)
 
     def memsample(self):
         """Return sample current RSS memory usage.
@@ -510,7 +515,8 @@ class Control:
         }, **kwargs)
 
     def revoke_by_stamped_headers(self, headers, destination=None, terminate=False,
-                                  signal=TERM_SIGNAME, **kwargs):
+                                  signal=TERM_SIGNAME, match=None, expires=None,
+                                  expires_in=None, **kwargs):
         """
         Tell all (or specific) workers to revoke a task by headers.
 
@@ -527,23 +533,50 @@ class Control:
         See Also:
             :meth:`broadcast` for supported keyword arguments.
         """
-        result = self.broadcast('revoke_by_stamped_headers', destination=destination, arguments={
+        conf = self.app.conf
+        match = match or conf.worker_revoke_by_stamped_headers_match
+        now = time.time()
+        if expires_in is not None:
+            expires_at = now + float(expires_in)
+        elif expires is not None:
+            expires_at = float(expires)
+        elif conf.worker_revoke_by_stamped_headers_persistent and \
+                conf.worker_revoke_by_stamped_headers_expires:
+            expires_at = now + float(conf.worker_revoke_by_stamped_headers_expires)
+        else:
+            expires_at = None
+        if expires_at is not None and expires_at <= now:
+            raise ValueError('Stamped header revocation has already expired')
+        rule = RevocationRule(headers, match=match, expires_at=expires_at,
+                              created_at=now)
+        if conf.worker_revoke_by_stamped_headers_persistent:
+            store = get_persistent_revocation_backend(
+                self.app.backend,
+                max_rules=conf.worker_revoke_by_stamped_headers_max,
+            )
+            store.save(
+                rule,
+                ttl=conf.worker_revoke_by_stamped_headers_expires
+                if rule.expires_at is None else None,
+            )
+
+        arguments = {
             'headers': headers,
             'terminate': terminate,
             'signal': signal,
-        }, **kwargs)
+        }
+        if match != 'exact' or expires is not None or expires_in is not None or \
+                conf.worker_revoke_by_stamped_headers_persistent:
+            arguments.update({
+                'match': match,
+                'expires': expires,
+                'expires_in': expires_in,
+                'revoke_rules': [rule.as_dict()],
+            })
+        result = self.broadcast('revoke_by_stamped_headers', destination=destination,
+                                arguments=arguments, **kwargs)
 
-        task_ids = set()
-        if result:
-            for host in result:
-                for response in host.values():
-                    if isinstance(response['ok'], set):
-                        task_ids.update(response['ok'])
-
-        if task_ids:
-            return self.revoke(list(task_ids), destination=destination, terminate=terminate, signal=signal, **kwargs)
-        else:
-            return result
+        return result
 
     def terminate(self, task_id,
                   destination=None, signal=TERM_SIGNAME, **kwargs):

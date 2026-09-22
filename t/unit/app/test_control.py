@@ -1,4 +1,4 @@
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -468,6 +468,27 @@ class test_Control:
             terminate=True,
             _options={'limit': 404},
         )
+
+    def test_revoke_by_stamped_headers_persistent_writes_shared_backend(self):
+        from celery.worker.revocation import RevocationRule
+        store = Mock()
+        self.app.conf.worker_revoke_by_stamped_headers_persistent = True
+        with patch(
+            'celery.app.control.get_persistent_revocation_backend',
+            return_value=store,
+        ):
+            self.app.control.revoke_by_stamped_headers(
+                {'tenant_id': 'tenant-1'}, match='regex', expires_in=60,
+            )
+
+        arguments = self.app.control.broadcast.call_args.kwargs['arguments']
+        assert arguments['match'] == 'regex'
+        assert arguments['revoke_rules'][0]['headers'] == {
+            'tenant_id': ['tenant-1'],
+        }
+        stored_rule = store.save.call_args.args[0]
+        assert isinstance(stored_rule, RevocationRule)
+        assert stored_rule.headers == {'tenant_id': ['tenant-1']}
 
     def test_election(self):
         self.app.control.election('some_id', 'topic', 'action')

@@ -82,6 +82,7 @@ class WorkController:
             'celery.worker.components:Pool',
             'celery.worker.components:Beat',
             'celery.worker.components:Timer',
+            'celery.worker.components:PersistentRevocations',
             'celery.worker.components:StateDB',
             'celery.worker.components:Consumer',
             'celery.worker.autoscale:WorkerComponent',

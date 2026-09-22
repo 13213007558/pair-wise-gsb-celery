@@ -17,6 +17,7 @@ from kombu.utils.objects import cached_property
 from celery import __version__
 from celery.exceptions import ImproperlyConfigured, WorkerShutdown, WorkerTerminate
 from celery.utils.collections import LimitedSet
+from .revocation import RevocationRegistry
 
 __all__ = (
     'SOFTWARE_INFO', 'reserved_requests', 'active_requests',
@@ -109,8 +110,8 @@ all_total_count = [0]
 #: the list of currently revoked tasks.  Persistent if ``statedb`` set.
 revoked = LimitedSet(maxlen=REVOKES_MAX, expires=REVOKE_EXPIRES)
 
-#: Mapping of stamped headers flagged for revoking.
-revoked_stamps = {}
+#: Stamped-header revocation rules active in this worker process.
+revoked_stamps = RevocationRegistry()
 
 should_stop = None
 should_terminate = None
@@ -266,7 +267,8 @@ class Persistent:
     """Stores worker state between restarts.
 
     This is the persistent data stored by the worker when
-    :option:`celery worker --statedb` is enabled.
+    :option:`celery worker --statedb` is enabled. Shared stamped-header
+    revocation rules use the configured result backend instead.
 
     Currently only stores revoked task id's.
     """

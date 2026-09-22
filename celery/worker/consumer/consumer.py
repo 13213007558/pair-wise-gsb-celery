@@ -682,6 +682,9 @@ class Consumer:
 
     def apply_eta_task(self, task):
         """Method called by the timer to apply a task with an ETA/countdown."""
+        if task.revoked():
+            self.qos.decrement_eventually()
+            return
         task_reserved(task)
         self.on_task_request(task)
         self.qos.decrement_eventually()

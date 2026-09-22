@@ -177,6 +177,9 @@ class test_Pidbox_green:
 class test_ControlPanel:
 
     def setup_method(self):
+        worker_state.reset_state()
+        revoked.clear()
+        revoked_stamps.clear()
         self.panel = self.create_panel(consumer=Consumer(self.app))
 
         @self.app.task(name='c.unittest.mytask', rate_limit=200, shared=False)
@@ -439,7 +442,7 @@ class test_ControlPanel:
     def test_active_safe(self):
         kwargsrepr = '<anything>'
         r = Request(
-            self.TaskMessage(self.mytask.name, id='do re mi',
+            self.TaskMessage(self.mytask.name,
                              kwargsrepr=kwargsrepr),
             app=self.app,
         )
@@ -795,6 +798,7 @@ class test_ControlPanel:
     )
     def test_revoke_by_stamped_headers(self, header_to_revoke):
         ids = []
+        requests = []
 
         # Create at least more than one request with the same stamped header
         for _ in range(2):
@@ -814,26 +818,34 @@ class test_ControlPanel:
                 message,
                 app=self.app,
             )
+            requests.append(request)
 
             # Add the request to the active_requests so the request is found
             # when the revoke_by_stamped_headers is called
             worker_state.active_requests.add(request)
             worker_state.task_reserved(request)
 
-        state = self.create_state()
-        state.consumer = Mock()
-        # Revoke by header
-        revoked_stamps.clear()
-        r = control.revoke_by_stamped_headers(state, header_to_revoke, terminate=True)
-        # Check all of the requests were revoked by a single header
-        for header, stamp in header_to_revoke.items():
-            assert header in r['ok']
-            for s in maybe_list(stamp):
-                assert str(s) in r['ok']
-        assert header_to_revoke.keys() == revoked_stamps.keys()
-        for key in header_to_revoke.keys():
-            assert list(maybe_list(header_to_revoke[key])) == revoked_stamps[key]
-        revoked_stamps.clear()
+        try:
+            state = self.create_state()
+            state.consumer = Mock()
+            # Revoke by header
+            revoked_stamps.clear()
+            r = control.revoke_by_stamped_headers(state, header_to_revoke, terminate=True)
+            # Check all of the requests were revoked by a single header
+            for header, stamp in header_to_revoke.items():
+                assert header in r['ok']
+                for s in maybe_list(stamp):
+                    assert str(s) in r['ok']
+            assert header_to_revoke.keys() == revoked_stamps.keys()
+            for key in header_to_revoke.keys():
+                assert sorted(str(s) for s in maybe_list(header_to_revoke[key])) == sorted(
+                    revoked_stamps[key]
+                )
+        finally:
+            for request in requests:
+                worker_state.task_ready(request)
+                worker_state.active_requests.discard(request)
+            revoked_stamps.clear()
 
     def test_revoke_return_value_terminate_true(self):
         header_to_revoke = {'foo': 'bar'}
@@ -1105,3 +1117,19 @@ class test_ControlPanel:
         assert 'test-123' in worker_state.revoked_stamps.get('monitoring_id', [])
 
         worker_state.active_requests.clear()
+
+    def test_revoke_by_stamped_headers_does_not_persist_task_ids_locally(self):
+        state = self.create_state()
+        request = Mock()
+        request.id = uuid()
+        request.stamped_headers = ['tenant_id']
+        request.stamps = {'tenant_id': 'tenant-1'}
+        worker_state.task_reserved(request)
+        try:
+            control.revoke_by_stamped_headers(
+                state, {'tenant_id': 'tenant-1'}, terminate=False,
+            )
+            assert request.id not in worker_state.revoked
+        finally:
+            worker_state.task_ready(request)
+            worker_state.revoked_stamps.clear()

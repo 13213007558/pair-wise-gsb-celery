@@ -357,6 +357,12 @@ NAMESPACES = Namespace(
         pool_start_method=Option('fork', type='string'),
         proc_alive_timeout=Option(4.0, type='float'),
         prefetch_multiplier=Option(4, type='int'),
+        revoke_by_stamped_headers_persistent=Option(False, type='bool'),
+        revoke_by_stamped_headers_expires=Option(
+            10800.0, type='float',
+        ),
+        revoke_by_stamped_headers_max=Option(50000, type='int'),
+        revoke_by_stamped_headers_match=Option('exact', type='string'),
         eta_task_limit=Option(None, type='int'),
         enable_prefetch_count_reduction=Option(True, type='bool'),
         disable_prefetch=Option(False, type='bool'),

@@ -460,10 +460,13 @@ class Request:
         if emit_retry:
             send_retry(self.task, request=self._context, einfo=None)
 
-    def _announce_revoked(self, reason, terminated, signum, expired):
+    def _announce_revoked(self, reason, terminated, signum, expired,
+                          event_reason=None):
         task_ready(self)
-        self.send_event('task-revoked',
-                        terminated=terminated, signum=signum, expired=expired)
+        fields = {'terminated': terminated, 'signum': signum, 'expired': expired}
+        if event_reason is not None:
+            fields['reason'] = event_reason
+        self.send_event('task-revoked', **fields)
         self.task.backend.mark_as_revoked(
             self.id, reason, request=self._context,
             store_result=self.store_errors,
@@ -481,35 +484,34 @@ class Request:
         if self.expires:
             expired = self.maybe_expire()
         revoked_by_id = self.id in revoked_tasks
-        revoked_by_header, revoking_header = False, None
+        revoked_rule, revoking_header = None, None
+        if not revoked_by_id:
+            revoked_rule, revoking_header = revoked_stamps.match(
+                self.stamped_headers, self.stamps,
+            )
 
-        if not revoked_by_id and self.stamped_headers:
-            for stamp in self.stamped_headers:
-                if stamp in revoked_stamps:
-                    revoked_header = revoked_stamps[stamp]
-                    stamped_header = self._message.headers['stamps'][stamp]
-
-                    if isinstance(stamped_header, (list, tuple)):
-                        for stamped_value in stamped_header:
-                            if stamped_value in maybe_list(revoked_header):
-                                revoked_by_header = True
-                                revoking_header = {stamp: stamped_value}
-                                break
-                    else:
-                        revoked_by_header = any([
-                            stamped_header in maybe_list(revoked_header),
-                            stamped_header == revoked_header,  # When the header is a single set value
-                        ])
-                        revoking_header = {stamp: stamped_header}
-                    break
-
-        if any((expired, revoked_by_id, revoked_by_header)):
+        if any((expired, revoked_by_id, revoked_rule is not None)):
+            if revoked_rule is not None and not self._already_revoked:
+                try:
+                    already_revoked = (
+                        self.task.backend.get_state(self.id) == states.REVOKED
+                    )
+                except Exception as exc:  # pragma: no cover - defensive path
+                    debug('Could not read revocation state for %s: %r', self.id, exc)
+                    already_revoked = False
+                if already_revoked:
+                    task_ready(self)
+                    self.acknowledge()
+                    self._already_revoked = True
+                    return True
             log_msg = 'Discarding revoked task: %s[%s]'
-            if revoked_by_header:
+            if revoked_rule is not None:
                 log_msg += ' (revoked by header: %s)' % revoking_header
             info(log_msg, self.name, self.id)
             self._announce_revoked(
-                'expired' if expired else 'revoked', False, None, expired,
+                'expired' if expired else (revoked_rule.reason if revoked_rule else 'revoked'),
+                False, None, expired,
+                event_reason=revoked_rule.reason if revoked_rule else None,
             )
             return True
         return False

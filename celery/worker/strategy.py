@@ -127,7 +127,7 @@ def default(task, app, consumer,
     Req = create_request_cls(Request, task, consumer.pool, hostname, eventer,
                              app=app)
 
-    revoked_tasks = consumer.controller.state.revoked
+    state = consumer.controller.state
 
     def task_message_handler(message, body, ack, reject, callbacks,
                              to_timestamp=to_timestamp):
@@ -159,7 +159,7 @@ def default(task, app, consumer,
                 'eta': req.eta,
             }
             info(_app_trace.LOG_RECEIVED, context, extra={'data': context})
-        if (req.expires or req.id in revoked_tasks) and req.revoked():
+        if (req.expires or req.id in state.revoked or req.stamped_headers) and req.revoked():
             return
 
         signals.task_received.send(sender=consumer, request=req)

@@ -22,6 +22,7 @@ from celery.worker import request as module
 from celery.worker import strategy
 from celery.worker.request import Request, create_request_cls
 from celery.worker.request import logger as req_logger
+from celery.worker.revocation import RevocationRule
 from celery.worker.state import revoked, revoked_stamps
 
 
@@ -559,7 +560,7 @@ class test_Request(RequestCase):
 
     def test_sets_store_errors(self):
         self.mytask.ignore_result = True
-        job = self.xRequest()
+        job = self.get_request(self.mytask.s(1, f='x'))
         assert not job.store_errors
 
         self.mytask.store_errors_even_if_ignored = True
@@ -818,6 +819,51 @@ class test_Request(RequestCase):
             assert job.revoked()
             assert job._already_revoked
             assert job.acknowledged
+
+    def test_revoked_by_stamped_headers_has_stable_reason_once(self):
+        revoked_stamps.clear()
+        job = self.get_request(self.mytask.s(1, f='x'))
+        rule = RevocationRule({'tenant': 't-1', 'deployment': 'd-1'})
+        job._message.headers['stamps'] = {
+            'tenant': 't-1', 'deployment': 'd-1',
+        }
+        job._message.headers['stamped_headers'] = ['tenant', 'deployment']
+        job._request_dict['stamps'] = job._message.headers['stamps']
+        job._request_dict['stamped_headers'] = ['tenant', 'deployment']
+        revoked_stamps.add(rule)
+        job.task.backend = Mock()
+
+        assert job.revoked() is True
+        assert job.revoked() is True
+
+        job._on_ack.assert_called_once_with(req_logger, job.connection_errors)
+        job.task.backend.mark_as_revoked.assert_called_once_with(
+            job.id, rule.reason, request=job._context, store_result=job.store_errors,
+        )
+        job.eventer.send.assert_called_once_with(
+            'task-revoked', uuid=job.id, reason=rule.reason,
+            terminated=False, signum=None, expired=False,
+        )
+        revoked_stamps.clear()
+
+    def test_revoked_by_stamped_headers_already_revoked_in_backend(self):
+        revoked_stamps.clear()
+        job = self.get_request(self.mytask.s(1, f='x'))
+        rule = RevocationRule({'tenant': 't-1'})
+        job._message.headers['stamps'] = {'tenant': 't-1'}
+        job._message.headers['stamped_headers'] = ['tenant']
+        job._request_dict['stamps'] = {'tenant': 't-1'}
+        job._request_dict['stamped_headers'] = ['tenant']
+        revoked_stamps.add(rule)
+        job.task.backend = Mock()
+        job.task.backend.get_state.return_value = states.REVOKED
+
+        assert job.revoked() is True
+
+        job._on_ack.assert_called_once_with(req_logger, job.connection_errors)
+        job.task.backend.mark_as_revoked.assert_not_called()
+        job.eventer.send.assert_not_called()
+        revoked_stamps.clear()
 
     def test_execute_does_not_execute_revoked(self):
         job = self.xRequest()

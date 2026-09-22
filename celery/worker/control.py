@@ -1,6 +1,7 @@
 """Worker remote control command implementations."""
 import io
 import tempfile
+import time
 from collections import UserDict, defaultdict, namedtuple
 
 from billiard.common import TERM_SIGNAME
@@ -16,6 +17,7 @@ from celery.utils.time import rate
 
 from . import state as worker_state
 from .request import Request
+from .revocation import EXACT, RevocationRule, normalize_headers
 
 __all__ = ('Panel',)
 
@@ -160,7 +162,9 @@ def revoke(state, task_id, terminate=False, signal=None, **kwargs):
     variadic='headers',
     signature='[key1=value1 [key2=value2 [... [keyN=valueN]]]]',
 )
-def revoke_by_stamped_headers(state, headers, terminate=False, signal=None, **kwargs):
+def revoke_by_stamped_headers(state, headers, terminate=False, signal=None,
+                              match=EXACT, expires=None, expires_in=None,
+                              revoke_rules=None, **kwargs):
     """Revoke task by header (or list of headers).
 
     Keyword Arguments:
@@ -176,13 +180,43 @@ def revoke_by_stamped_headers(state, headers, terminate=False, signal=None, **kw
     #     Outside of this scope that is a function.
     # supports list argument since 3.1
     signum = _signals.signum(signal or TERM_SIGNAME)
-
-    if isinstance(headers, list):
-        headers = {h.split('=')[0]: h.split('=')[1] for h in headers}
-
-    for header, stamps in headers.items():
-        updated_stamps = maybe_list(worker_state.revoked_stamps.get(header) or []) + list(maybe_list(stamps))
-        worker_state.revoked_stamps[header] = updated_stamps
+    conf = state.app.conf
+    match = match or conf.worker_revoke_by_stamped_headers_match
+    now = time.time()
+    if expires_in is not None:
+        expires_at = now + float(expires_in)
+    elif expires is not None:
+        expires_at = float(expires)
+    elif conf.worker_revoke_by_stamped_headers_persistent and \
+            conf.worker_revoke_by_stamped_headers_expires:
+        expires_at = now + float(conf.worker_revoke_by_stamped_headers_expires)
+    else:
+        expires_at = None
+    if expires_at is not None and expires_at <= now:
+        raise ValueError('Stamped header revocation has already expired')
+    rule = RevocationRule(normalize_headers(headers), match=match,
+                          expires_at=expires_at, created_at=now)
+    is_persistent = bool(
+        conf.worker_revoke_by_stamped_headers_persistent and
+        getattr(state, 'persistent_revocations', None) is not None
+    )
+    if is_persistent:
+        worker_state.revoked_stamps.merge(
+            state.persistent_revocations.load(now=now), now=now,
+        )
+    worker_state.revoked_stamps.add(rule)
+    store = getattr(state, 'persistent_revocations', None)
+    if is_persistent:
+        try:
+            store.save(
+                rule,
+                ttl=conf.worker_revoke_by_stamped_headers_expires
+                if rule.expires_at is None else None,
+            )
+        except Exception as exc:  # pragma: no cover - defensive path
+            logger.warning('Failed to persist stamped revocation rule: %s', exc)
+    if revoke_rules:
+        worker_state.revoked_stamps.merge(revoke_rules, now=now)
 
     if not terminate:
         return ok(f'headers {headers} flagged as revoked, but not terminated')
@@ -197,21 +231,18 @@ def revoke_by_stamped_headers(state, headers, terminate=False, signal=None, **kw
 
     for req in active_requests:
         # Check stamps exist
-        if hasattr(req, "stamps") and req.stamps:
-            # if so, check if any stamps match a revoked stamp
-            for expected_header_key, expected_header_value in headers.items():
-                if expected_header_key in req.stamps:
-                    expected_header_value = maybe_list(expected_header_value)
-                    actual_header = maybe_list(req.stamps[expected_header_key])
-                    matching_stamps_for_request = set(actual_header) & set(expected_header_value)
-                    # Check any possible match regardless if the stamps are a sequence or not
-                    if matching_stamps_for_request:
-                        terminated_scheme_to_stamps_mapping[expected_header_key].update(matching_stamps_for_request)
-                        req.terminate(state.consumer.pool, signal=signum)
+        if hasattr(req, "stamps") and isinstance(getattr(req, 'stamps', None), dict) and req.stamps:
+            matched_rule, matching_stamps_for_request = worker_state.revoked_stamps.match(
+                req.stamped_headers, req.stamps, now,
+            )
+            if matched_rule is not None:
+                for header, values in matching_stamps_for_request.items():
+                    terminated_scheme_to_stamps_mapping[header].update(values)
+                req.terminate(state.consumer.pool, signal=signum)
 
     if not terminated_scheme_to_stamps_mapping:
-        return ok(f'headers {headers} were not terminated')
-    return ok(f'headers {terminated_scheme_to_stamps_mapping} revoked')
+        return ok(f'headers {headers} flagged as revoked, but not terminated')
+    return ok(f'headers {dict(terminated_scheme_to_stamps_mapping)} revoked')
 
 
 def _revoke(state, task_ids, terminate=False, signal=None, **kwargs):
@@ -388,7 +419,7 @@ def heartbeat(state):
 # -- Worker
 
 @inspect_command(visible=False)
-def hello(state, from_node, revoked=None, **kwargs):
+def hello(state, from_node, revoked=None, revoked_stamp_rules=None, **kwargs):
     """Request mingle sync-data."""
     # pylint: disable=redefined-outer-name
     # XXX Note that this redefines `revoked`:
@@ -399,10 +430,15 @@ def hello(state, from_node, revoked=None, **kwargs):
             worker_state.revoked.update(revoked)
         # Do not send expired items to the other worker.
         worker_state.revoked.purge()
-        return {
+        worker_state.revoked_stamps.merge(revoked_stamp_rules)
+        response = {
             'revoked': worker_state.revoked._data,
             'clock': state.app.clock.forward(),
         }
+        rules = worker_state.revoked_stamps.snapshot()
+        if rules:
+            response['revoked_stamp_rules'] = rules
+        return response
 
 
 @inspect_command(default_timeout=0.2)

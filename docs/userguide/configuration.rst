@@ -3703,6 +3703,48 @@ may be appended to the file name (depending on Python version).
 
 Can also be set via the :option:`celery worker --statedb` argument.
 
+.. setting:: worker_revoke_by_stamped_headers_persistent
+
+``worker_revoke_by_stamped_headers_persistent``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: Disabled.
+
+Store stamped-header revocation rules in the Redis result backend and load
+them before workers consume tasks. Redis provides the shared keys, TTLs and
+atomic index updates needed for concurrent revocations.
+
+.. setting:: worker_revoke_by_stamped_headers_expires
+
+``worker_revoke_by_stamped_headers_expires``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: 10800 seconds (3 hours).
+
+Default lifetime, in seconds, for persistent stamped-header revocation rules
+when a revocation does not specify ``expires`` or ``expires_in``.
+
+.. setting:: worker_revoke_by_stamped_headers_max
+
+``worker_revoke_by_stamped_headers_max``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: 50000.
+
+Maximum number of persistent stamped-header revocation rules retained by the
+backend.
+
+.. setting:: worker_revoke_by_stamped_headers_match
+
+``worker_revoke_by_stamped_headers_match``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``"exact"``.
+
+Default matching strategy used by
+:meth:`~celery.app.control.Control.revoke_by_stamped_headers`. Supported
+values are ``"exact"`` and ``"regex"``.
+
 .. setting:: worker_timer_precision
 
 ``worker_timer_precision``

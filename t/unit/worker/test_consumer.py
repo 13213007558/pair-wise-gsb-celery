@@ -1668,6 +1668,11 @@ class test_Mingle:
             'A@example.com': {
                 'clock': 312,
                 'revoked': Aig._data,
+                'revoked_stamp_rules': [
+                    {'id': 'remote-rule', 'headers': {'tenant': ['remote']},
+                     'match': 'exact', 'expires_at': None,
+                     'created_at': 2, 'reason': 'revoked'},
+                ],
             },
             'B@example.com': {
                 'clock': 29,
@@ -1679,15 +1684,24 @@ class test_Mingle:
         }
 
         our_revoked = c.controller.state.revoked = LimitedSet()
+        our_rules = [{'id': 'rule-1', 'headers': {'tenant': ['t1']},
+                     'match': 'exact', 'expires_at': None,
+                     'created_at': 1, 'reason': 'revoked'}]
+        c.controller.state.revoked_stamps.snapshot.return_value = our_rules
 
         mingle.start(c)
-        I.hello.assert_called_with(c.hostname, our_revoked._data)
+        I.hello.assert_called_with(c.hostname, our_revoked._data, our_rules)
         c.app.clock.adjust.assert_has_calls([
             call(312), call(29),
         ], any_order=True)
         assert 'Aig-1' in our_revoked
         assert 'Aig-2' in our_revoked
         assert 'Big-1' in our_revoked
+        c.controller.state.revoked_stamps.merge.assert_any_call([
+            {'id': 'remote-rule', 'headers': {'tenant': ['remote']},
+             'match': 'exact', 'expires_at': None,
+             'created_at': 2, 'reason': 'revoked'},
+        ])
 
 
 def _amqp_connection():

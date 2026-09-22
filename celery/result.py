@@ -165,6 +165,7 @@ class AsyncResult(ResultBase):
                                 reply=wait, timeout=timeout)
 
     def revoke_by_stamped_headers(self, headers, connection=None, terminate=False, signal=None,
+                                  match=None, expires=None, expires_in=None,
                                   wait=False, timeout=None):
         """Send revoke signal to all workers only for tasks with matching headers values.
 
@@ -184,9 +185,11 @@ class AsyncResult(ResultBase):
             timeout (float): Time in seconds to wait for replies when
                 ``wait`` is enabled.
         """
-        self.app.control.revoke_by_stamped_headers(headers, connection=connection,
-                                                   terminate=terminate, signal=signal,
-                                                   reply=wait, timeout=timeout)
+        kwargs = dict(connection=connection, terminate=terminate, signal=signal,
+                      reply=wait, timeout=timeout)
+        if match is not None or expires is not None or expires_in is not None:
+            kwargs.update(match=match, expires=expires, expires_in=expires_in)
+        self.app.control.revoke_by_stamped_headers(headers, **kwargs)
 
     def get(self, timeout=None, propagate=True, interval=0.5,
             no_ack=True, follow_parents=True, callback=None, on_message=None,

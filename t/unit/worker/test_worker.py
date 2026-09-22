@@ -399,11 +399,27 @@ class test_Consumer(ConsumerCase):
         c = self.NoopConsumer()
         c.qos = QoS(None, 10)
         task = Mock(name='task', id='1234213')
+        task.revoked.return_value = False
         qos = c.qos.value
         c.apply_eta_task(task)
         assert task in state.reserved_requests
         assert c.qos.value == qos - 1
         assert self.buffer.get_nowait() is task
+
+    def test_apply_eta_task_revoked_before_dispatch(self):
+        c = self.NoopConsumer()
+        c.qos = QoS(None, 10)
+        c.on_task_request = Mock()
+        task = Mock(name='revoked-task')
+        task.revoked.return_value = True
+        qos = c.qos.value
+
+        c.apply_eta_task(task)
+
+        task.revoked.assert_called_once_with()
+        c.on_task_request.assert_not_called()
+        assert c.qos.value == qos - 1
+        assert self.buffer.empty()
 
     def test_receieve_message_eta_isoformat(self):
         c = self.LoopConsumer()
@@ -1191,6 +1207,36 @@ class test_WorkController(ConsumerCase):
             assert worker._persistence
         finally:
             state.Persistent = Persistent
+
+    def test_persistent_stamped_header_revocations_loaded_before_consume(self):
+        self.app.conf.worker_revoke_by_stamped_headers_expires = 60
+        from celery.worker.revocation import RevocationRule
+        worker = self.create_worker()
+        rule = RevocationRule({'tenant': 'tenant-1'})
+        store = Mock()
+        store.load.return_value = [rule.as_dict()]
+        state.revoked_stamps.clear()
+        step = None
+        try:
+            with patch('celery.worker.components.get_persistent_revocation_backend',
+                       return_value=store):
+                self.app.conf.worker_revoke_by_stamped_headers_persistent = True
+                step = components.PersistentRevocations(worker)
+                step.create(worker)
+
+            matched, stamps = state.revoked_stamps.match(
+                ['tenant'], {'tenant': 'tenant-1'},
+            )
+            assert matched is not None
+            assert stamps == {'tenant': ['tenant-1']}
+            store.cleanup.assert_called_once_with()
+            store.load.assert_called_once()
+        finally:
+            if step is not None:
+                step.stop(worker)
+            worker.timer.stop()
+            self.app.conf.worker_revoke_by_stamped_headers_persistent = False
+            state.revoked_stamps.clear()
 
     def test_process_task_sem(self):
         worker = self.worker

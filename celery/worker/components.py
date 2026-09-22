@@ -13,7 +13,10 @@ from celery.exceptions import ImproperlyConfigured
 from celery.platforms import IS_WINDOWS
 from celery.utils.log import worker_logger as logger
 
-__all__ = ('Timer', 'Hub', 'Pool', 'Beat', 'StateDB', 'Consumer')
+from . import state as worker_state
+from .revocation import get_persistent_revocation_backend
+
+__all__ = ('Timer', 'Hub', 'Pool', 'Beat', 'PersistentRevocations', 'StateDB', 'Consumer')
 
 GREEN_POOLS = {'eventlet', 'gevent'}
 
@@ -205,8 +208,47 @@ class Beat(bootsteps.StartStopStep):
         return b
 
 
+class PersistentRevocations(bootsteps.Step):
+    """Load shared stamped-header revocation rules before task consumption."""
+
+    requires = (Timer,)
+
+    def __init__(self, w, **kwargs):
+        self.enabled = bool(w.app.conf.worker_revoke_by_stamped_headers_persistent)
+        w.persistent_revocations = None
+        worker_state.revoked_stamps.persistent = None
+        super().__init__(w, **kwargs)
+
+    def create(self, w):
+        conf = w.app.conf
+        store = get_persistent_revocation_backend(
+            w.app.backend,
+            max_rules=conf.worker_revoke_by_stamped_headers_max,
+        )
+        w.persistent_revocations = store
+        worker_state.revoked_stamps.persistent = store
+        store.cleanup()
+        worker_state.revoked_stamps.load_persistent()
+        self._timer_entry = w.timer.call_repeatedly(60.0, self.refresh)
+
+    def refresh(self):
+        try:
+            worker_state.revoked_stamps.load_persistent()
+        except Exception as exc:  # pragma: no cover - defensive path
+            logger.warning('Failed to refresh persistent stamped revocations: %s', exc)
+
+    def stop(self, w):
+        entry = getattr(self, '_timer_entry', None)
+        if entry is not None and w.timer is not None:
+            w.timer.cancel(entry)
+        worker_state.revoked_stamps.persistent = None
+        w.persistent_revocations = None
+
+
 class StateDB(bootsteps.Step):
     """Bootstep that sets up between-restart state database file."""
+
+    requires = (PersistentRevocations,)
 
     def __init__(self, w, **kwargs):
         self.enabled = w.statedb
