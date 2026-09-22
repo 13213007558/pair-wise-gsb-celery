@@ -1029,6 +1029,7 @@ class Celery:
         ignore_result = options.pop('ignore_result', False)
         options = router.route(
             options, route_name or name, args, kwargs, task_type)
+        amqp.resolve_task_protocol(options)
 
         if eta or countdown:
             driver_type = self.producer_pool.connections.connection.transport.driver_type
@@ -1113,6 +1114,7 @@ class Celery:
             ignore_result=ignore_result,
             replaced_task_nesting=replaced_task_nesting, **options
         )
+        options.pop('task_protocol', None)
 
         stamped_headers = options.pop('stamped_headers', [])
         for stamp in stamped_headers:

@@ -12,7 +12,7 @@ from warnings import warn
 
 from billiard.einfo import ExceptionInfo, ExceptionWithTraceback
 from kombu.exceptions import EncodeError
-from kombu.serialization import loads as loads_message
+from kombu.serialization import loads as kombu_loads_message
 from kombu.serialization import prepare_accept_content
 from kombu.utils.encoding import safe_repr, safe_str
 
@@ -20,6 +20,7 @@ from celery import current_app, group, signals, states
 from celery._state import _task_stack
 from celery.app.task import Context
 from celery.app.task import Task as BaseTask
+from celery.app.task_protocol import validate_decoded_body
 from celery.exceptions import BackendGetMetaError, Ignore, InvalidTaskError, Reject, Retry
 from celery.result import AsyncResult
 from celery.utils.log import get_logger
@@ -118,6 +119,21 @@ _localized = []
 _patched = {}
 
 trace_ok_t = namedtuple('trace_ok_t', ('retval', 'info', 'runtime', 'retstr'))
+
+
+def loads_message(body, content_type, content_encoding, accept=None):
+    payload = kombu_loads_message(
+        body, content_type, content_encoding, accept=accept,
+    )
+    if (
+        isinstance(payload, tuple)
+        and len(payload) == 4
+        and payload[0] == 'celery_protocol3'
+    ):
+        validate_decoded_body(payload, 3)
+        return payload[1:]
+    validate_decoded_body(payload, 2)
+    return payload
 
 
 def info(fmt, context):

@@ -5,7 +5,9 @@ from kombu.asynchronous.timer import to_timestamp
 
 from celery import signals
 from celery.app import trace as _app_trace
-from celery.exceptions import InvalidTaskError
+from celery.app.task_protocol import (PROTOCOL3_BODY_MARKER, TASK_PROTOCOL_HEADER,
+                                      validate_decoded_body)
+from celery.exceptions import InvalidTaskError, TaskProtocolError
 from celery.utils.imports import symbol_by_name
 from celery.utils.log import get_logger
 from celery.utils.saferepr import saferepr
@@ -83,6 +85,7 @@ def proto1_to_proto2(message, body):
         kwargsrepr=saferepr(kwargs),
         headers=message.headers,
     )
+    body[TASK_PROTOCOL_HEADER] = 1
     try:
         body['group'] = body['taskset']
     except KeyError:
@@ -94,6 +97,27 @@ def proto1_to_proto2(message, body):
         'chain': None,
     }
     return (args, kwargs, embed), body, True, body.get('utc', True)
+
+
+def proto3_to_proto2(message, body):
+    """Convert protocol 3 arguments to the internal protocol 2 shape."""
+    validate_decoded_body(body, 3)
+    try:
+        marker, args, kwargs, embed = body
+    except (TypeError, ValueError) as exc:
+        raise TaskProtocolError(
+            'invalid_body', str(exc), protocol=3, stage='decode',
+        )
+    if marker != PROTOCOL3_BODY_MARKER:
+        raise TaskProtocolError(
+            'unsupported_version', 'missing protocol 3 body marker',
+            protocol=3, stage='decode',
+        )
+    if not isinstance(kwargs, dict):
+        raise InvalidTaskError(
+            'Task keyword arguments must be a mapping',
+        )
+    return (args, kwargs, embed), message.headers, True, True
 
 
 def default(task, app, consumer,
@@ -131,16 +155,20 @@ def default(task, app, consumer,
 
     def task_message_handler(message, body, ack, reject, callbacks,
                              to_timestamp=to_timestamp):
-        if body is None and 'args' not in message.payload:
-            body, headers, decoded, utc = (
-                message.body, message.headers, False, app.uses_utc_timezone(),
+        protocol = message.headers.get(TASK_PROTOCOL_HEADER, 2)
+        if protocol == 3:
+            body, headers, decoded, utc = proto3_to_proto2(
+                message, message.payload if body is None else body,
             )
+        elif body is None:
+            body, headers, decoded, utc = (
+                message.body, message.headers, False,
+                app.uses_utc_timezone(),
+            )
+        elif 'args' in body:
+            body, headers, decoded, utc = hybrid_to_proto2(message, body)
         else:
-            if 'args' in message.payload:
-                body, headers, decoded, utc = hybrid_to_proto2(message,
-                                                               message.payload)
-            else:
-                body, headers, decoded, utc = proto1_to_proto2(message, body)
+            body, headers, decoded, utc = proto1_to_proto2(message, body)
 
         req = Req(
             message,

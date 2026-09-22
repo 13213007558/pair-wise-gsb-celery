@@ -13,7 +13,69 @@
 Task messages
 =============
 
+Compatibility policy
+--------------------
+
+Protocol selection is explicit and defaults to 2 while producers and workers
+are upgraded. A producer may select a version globally with
+:setting:`task_protocol`, per task class/annotation, per call, or through a
+router/queue policy. Queue caps in :setting:`task_queue_protocols` are applied
+after routing; the default policy downgrades a newer request to the queue cap,
+while ``task_protocol_negotiation = "reject"`` fails before publishing.
+
+Synchronous ``Task.apply_async``/``app.send_task`` calls and pooled/custom
+producers passed into those APIs use the same negotiation rules. The rules are
+evaluated before serialization and publishing; a producer used from an event
+loop must not upgrade a queue merely because it retries or reconnects. Publish
+retry only repeats the already negotiated message, while consumer reconnection
+only restores delivery. Direct ``Producer.publish`` calls bypass Celery and
+must implement the same policy themselves.
+
+Workers validate protocol, required headers, ``content_type``,
+``content_encoding`` and version range before decoding task arguments. After
+decoding, they validate the complete envelope before binding args/kwargs, so a
+partial or mis-shaped body can never execute with fallback arguments.
+
+Rejections carry a machine-observable reason in
+``task-protocol-rejected`` events and the ``task_rejected`` signal:
+``unsupported_version``, ``version_mismatch``, ``missing_field``,
+``extra_field``, ``invalid_headers``, ``invalid_version``,
+``serializer_not_allowed``, ``serializer_unknown`` and
+``serializer_error``. Configure the terminal path with
+:setting:`task_protocol_incompatible_action`: reject for broker dead-lettering
+or discard, redelivery, or explicit republish to a dead-letter exchange.
+Decode failures are never acknowledged as successful task processing.
+
+Task identity, ``root_id``, ``parent_id``, stamped headers/stamps, retry, ETA
+and expiry metadata are transport headers and are preserved without decoding
+task arguments. Signed serializers still wrap the original content type; the
+worker verifies signatures before the inner serializer is used.
+
 .. _message-protocol-task-v2:
+
+Version 3
+---------
+
+Protocol 3 keeps the protocol 2 header set and adds an explicit ``task_protocol:
+3`` header. The body is a four-item envelope:
+
+.. code-block:: python
+
+    (
+        "celery_protocol3",
+        object[] args,
+        Mapping kwargs,
+        Mapping embed,
+    )
+
+The marker makes the new structure non-executable by workers that only
+understand protocol 2. Unknown protocol 3 headers or embedded fields are
+rejected instead of being silently discarded. ``argsrepr`` and
+``kwargsrepr`` remain headers and must not be trusted as values; only decoded
+``args`` and ``kwargs`` are passed to the task.
+
+Version 3 workers retain every protocol 2 routing, retry, ETA, identity,
+signature and stamping field.
 
 Version 2
 ---------

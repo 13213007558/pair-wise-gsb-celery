@@ -424,6 +424,14 @@ class test_task_retries(TasksCase):
         sig = self.retry_task.signature_from_request()
         assert sig.options['headers']['custom'] == 10.1
 
+    def test_signature_from_request__preserves_task_protocol(self):
+        self.retry_task.push_request()
+        self.retry_task.request.task_protocol = 3
+
+        sig = self.retry_task.signature_from_request()
+
+        assert sig.options['task_protocol'] == 3
+
     def test_signature_from_request__filters_x_death_headers(self):
         """
         Test that X-Death headers are filtered out during retries to prevent

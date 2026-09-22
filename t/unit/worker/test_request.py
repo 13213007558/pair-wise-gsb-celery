@@ -1257,9 +1257,8 @@ class test_Request(RequestCase):
 
     def test_from_message_invalid_kwargs(self):
         m = self.TaskMessage(self.mytask.name, args=(), kwargs='foo')
-        req = Request(m, app=self.app)
         with pytest.raises(InvalidTaskError):
-            raise req.execute().exception.exc
+            Request(m, app=self.app)
 
     def test_on_hard_timeout_acks_late(self, patching):
         error = patching('celery.worker.request.error')

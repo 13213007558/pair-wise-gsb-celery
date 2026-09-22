@@ -7,16 +7,19 @@ from weakref import WeakValueDictionary
 
 from kombu import Connection, Consumer, Exchange, Producer, Queue, pools
 from kombu.common import Broadcast
+from kombu.serialization import registry
 from kombu.utils.functional import maybe_list
 from kombu.utils.objects import cached_property
 
 from celery import signals
+from celery.exceptions import TaskProtocolError
 from celery.utils.nodenames import anon_nodename
 from celery.utils.saferepr import saferepr
 from celery.utils.text import indent as textindent
 from celery.utils.time import maybe_make_aware
 
 from . import routes as _routes
+from .task_protocol import LATEST_TASK_PROTOCOL, PROTOCOL3_BODY_MARKER, TASK_PROTOCOL_HEADER
 
 __all__ = ('AMQP', 'Queues', 'task_message')
 
@@ -260,12 +263,80 @@ class AMQP:
         self.task_protocols = {
             1: self.as_task_v1,
             2: self.as_task_v2,
+            3: self.as_task_v3,
         }
         self.app._conf.bind_to(self._handle_conf_update)
 
     @cached_property
     def create_task_message(self):
-        return self.task_protocols[self.app.conf.task_protocol]
+        return self._create_task_message
+
+    def _create_task_message(self, *args, **kwargs):
+        protocol = kwargs.pop('task_protocol', self.app.conf.task_protocol)
+        try:
+            protocol_builder = self.task_protocols[protocol]
+        except KeyError:
+            raise TaskProtocolError(
+                'unsupported_version',
+                f'producer supports protocols {sorted(self.task_protocols)}, '
+                f'not protocol {protocol}',
+                protocol=protocol, stage='publish',
+            )
+        return protocol_builder(*args, **kwargs)
+
+    def resolve_task_protocol(self, options):
+        """Resolve the protocol for a task and enforce queue compatibility."""
+        protocol = options.pop('task_protocol', self.app.conf.task_protocol)
+        if protocol not in self.task_protocols:
+            raise TaskProtocolError(
+                'unsupported_version',
+                f'producer supports protocols {sorted(self.task_protocols)}, '
+                f'not protocol {protocol}',
+                protocol=protocol, stage='publish',
+            )
+
+        queue = options.get('queue')
+        queue_name = queue.name if isinstance(queue, Queue) else queue
+        queue_max_protocol = self.app.conf.task_queue_protocols.get(queue_name)
+        if queue_max_protocol is None and queue_name:
+            try:
+                configured_queue = self.queues[queue_name]
+            except KeyError:
+                configured_queue = None
+            if configured_queue is not None:
+                queue_max_protocol = getattr(
+                    configured_queue, 'task_protocol_max', None,
+                )
+
+        if queue_max_protocol is not None:
+            try:
+                queue_max_protocol = int(queue_max_protocol)
+            except (TypeError, ValueError):
+                raise TaskProtocolError(
+                    'invalid_version',
+                    f'queue {queue_name!r} has invalid protocol cap '
+                    f'{queue_max_protocol!r}',
+                    protocol=protocol, stage='publish',
+                )
+            if queue_max_protocol not in self.task_protocols:
+                raise TaskProtocolError(
+                    'unsupported_version',
+                    f'queue {queue_name!r} caps task protocol to '
+                    f'{queue_max_protocol}',
+                    protocol=queue_max_protocol, stage='publish',
+                )
+            if protocol > queue_max_protocol:
+                if self.app.conf.task_protocol_negotiation == 'reject':
+                    raise TaskProtocolError(
+                        'version_mismatch',
+                        f'queue {queue_name!r} accepts protocol '
+                        f'{queue_max_protocol}, but protocol {protocol} was requested',
+                        protocol=protocol, stage='publish',
+                    )
+                protocol = min(protocol, queue_max_protocol)
+
+        options['task_protocol'] = protocol
+        return protocol
 
     @cached_property
     def send_task_message(self):
@@ -370,6 +441,7 @@ class AMQP:
 
         stamps = {header: options[header] for header in stamped_headers or []}
         headers = {
+            TASK_PROTOCOL_HEADER: 2,
             'lang': 'py',
             'task': name,
             'id': task_id,
@@ -416,6 +488,19 @@ class AMQP:
                 'eta': eta,
                 'expires': expires,
             } if create_sent_event else None,
+        )
+
+    def as_task_v3(self, *args, **kwargs):
+        message = self.as_task_v2(*args, **kwargs)
+        headers, properties, body, sent_event = message
+        task_args, task_kwargs, embed = body
+        headers[TASK_PROTOCOL_HEADER] = LATEST_TASK_PROTOCOL
+        body = (PROTOCOL3_BODY_MARKER, task_args, task_kwargs, embed)
+        if sent_event is not None:
+            sent_event[TASK_PROTOCOL_HEADER] = LATEST_TASK_PROTOCOL
+        return task_message(
+            headers=headers, properties=properties, body=body,
+            sent_event=sent_event,
         )
 
     def as_task_v1(self, task_id, name, args=None, kwargs=None,
@@ -550,6 +635,14 @@ class AMQP:
                 routing_key = routing_key or queue.routing_key or default_rkey
             if declare is None and queue and not isinstance(queue, Broadcast):
                 declare = [queue]
+
+            serializer_name = serializer or default_serializer
+            if serializer_name not in registry._encoders:
+                raise TaskProtocolError(
+                    'serializer_unknown',
+                    f'no encoder installed for serializer {serializer_name!r}',
+                    stage='publish',
+                )
 
             # merge default and custom policy
             retry = default_retry if retry is None else retry

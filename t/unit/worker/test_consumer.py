@@ -325,6 +325,114 @@ class test_Consumer(ConsumerTestCase):
         with subtests.test("maximum prefetch is reached"):
             assert c._maximum_prefetch_restored is True
 
+    def test_task_handler_rejects_unsupported_protocol_before_decode(self):
+        c = self.get_consumer()
+        message = Mock(
+            headers={'task': 'tasks.add', 'id': 'id', 'task_protocol': 99},
+            content_type='application/json',
+            content_encoding='utf-8',
+            accept={'application/json'},
+            properties={},
+            body=b'',
+        )
+        message.decode.side_effect = AssertionError('message must not be decoded')
+        c.on_task_protocol_error = Mock()
+
+        c.create_task_handler()(message)
+
+        message.decode.assert_not_called()
+        c.on_task_protocol_error.assert_called_once()
+        exc = c.on_task_protocol_error.call_args.args[1]
+        assert exc.reason == 'unsupported_version'
+        assert exc.protocol == 99
+
+    def test_task_handler_rejects_disallowed_serializer_before_decode(self):
+        c = self.get_consumer()
+        message = Mock(
+            headers={'task': 'tasks.add', 'id': 'id', 'task_protocol': 2},
+            content_type='application/x-python-serialize',
+            content_encoding='binary',
+            accept={'application/json'},
+            properties={},
+            body=b'',
+        )
+        message.decode.side_effect = AssertionError('message must not be decoded')
+        c.on_task_protocol_error = Mock()
+
+        c.create_task_handler()(message)
+
+        message.decode.assert_not_called()
+        exc = c.on_task_protocol_error.call_args.args[1]
+        assert exc.reason == 'serializer_not_allowed'
+
+    def test_decode_error_is_rejected_not_acknowledged(self):
+        c = self.get_consumer()
+        message = Mock()
+        message.headers = {'id': 'task-id'}
+        message.content_type = 'application/json'
+        message.content_encoding = 'utf-8'
+        message.body = b'{'
+        c.on_task_protocol_error = Mock()
+
+        c.on_decode_error(message, ValueError('bad json'))
+
+        message.ack.assert_not_called()
+        exc = c.on_task_protocol_error.call_args.args[1]
+        assert exc.reason == 'serializer_error'
+        assert exc.stage == 'decode'
+
+    def test_protocol_error_reject_action_uses_reject_without_ack(self):
+        c = self.get_consumer()
+        message = Mock()
+        message.headers = {'id': 'task-id', 'task': 'tasks.add'}
+        message.properties = {}
+        c.event_dispatcher = None
+        self.app.conf.task_protocol_incompatible_action = 'reject'
+        exc = type('ProtocolExc', (), {
+            'reason': 'missing_field',
+            'protocol': 3,
+            'stage': 'decode',
+        })()
+
+        c.on_task_protocol_error(message, exc)
+
+        message.reject_log_error.assert_called_once_with(
+            logging.getLogger('celery.worker.consumer.consumer'),
+            c.connection_errors, requeue=False,
+        )
+        message.ack_log_error.assert_not_called()
+
+    def test_protocol_error_dead_letter_action_publishes_and_acks(self):
+        c = self.get_consumer()
+        message = Mock()
+        message.headers = {'id': 'task-id', 'task': 'tasks.add'}
+        message.properties = {'correlation_id': 'task-id'}
+        message.body = b'{}'
+        message.content_type = 'application/json'
+        message.content_encoding = 'utf-8'
+        c.event_dispatcher = None
+        producer = Mock()
+        producer.__enter__ = Mock(return_value=producer)
+        producer.__exit__ = Mock(return_value=False)
+        c.app.amqp.Producer = Mock(return_value=producer)
+        self.app.conf.task_protocol_incompatible_action = 'dead-letter'
+        self.app.conf.task_protocol_dead_letter_exchange = 'dlx'
+        self.app.conf.task_protocol_dead_letter_routing_key = 'dead'
+        exc = type('ProtocolExc', (), {
+            'reason': 'extra_field',
+            'protocol': 3,
+            'stage': 'decode',
+        })()
+
+        c.on_task_protocol_error(message, exc)
+
+        producer.publish.assert_called_once()
+        kwargs = producer.publish.call_args.kwargs
+        assert kwargs['exchange'] == 'dlx'
+        assert kwargs['routing_key'] == 'dead'
+        assert kwargs['headers']['x-celery-reject-reason'] == 'extra_field'
+        message.ack_log_error.assert_called_once()
+
     def test_flush_events(self):
         c = self.get_consumer()
         c.event_dispatcher = None

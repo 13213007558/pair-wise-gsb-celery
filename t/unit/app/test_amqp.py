@@ -4,6 +4,8 @@ from unittest.mock import Mock, patch
 import pytest
 from kombu import Exchange, Queue
 
+from celery.exceptions import TaskProtocolError
+
 from celery import uuid
 from celery.app.amqp import Queues, utf8dict
 from celery.utils.time import to_utc
@@ -596,3 +598,80 @@ class test_as_task_v2(test_AMQP_Base):
         assert embed['callbacks'] == [utf8dict(t.s(1)), utf8dict(t.s(2))]
         assert embed['errbacks'] == [utf8dict(t.s(3)), utf8dict(t.s(4))]
         assert embed['chord'] == utf8dict(t.s(5))
+
+
+class test_as_task_v3(test_AMQP_Base):
+
+    def test_v3_envelope_preserves_protocol_fields(self):
+        message = self.app.amqp.as_task_v3(
+            'task-id', 'foo', args=(1,), kwargs={'value': 2},
+            root_id='root-id', parent_id='parent-id', retries=4,
+            eta='2026-01-01T00:00:00+00:00',
+            stamped_headers=['tenant'], tenant='tenant-a',
+        )
+
+        assert message.headers['task_protocol'] == 3
+        assert message.headers['id'] == 'task-id'
+        assert message.headers['root_id'] == 'root-id'
+        assert message.headers['parent_id'] == 'parent-id'
+        assert message.headers['retries'] == 4
+        assert message.headers['stamps'] == {'tenant': 'tenant-a'}
+        assert message.body[0] == 'celery_protocol3'
+        assert message.body[1:] == ((1,), {'value': 2}, {
+            'callbacks': None,
+            'errbacks': None,
+            'chain': None,
+            'chord': None,
+        })
+
+    def test_queue_cap_downgrades_v3_to_v2(self):
+        self.app.conf.task_protocol = 3
+        self.app.conf.task_queue_protocols = {'celery': 2}
+        options = {'queue': 'celery'}
+
+        protocol = self.app.amqp.resolve_task_protocol(options)
+
+        assert protocol == 2
+        message = self.app.amqp.create_task_message(
+            'task-id', 'foo', **options,
+        )
+        assert message.headers['task_protocol'] == 2
+        assert len(message.body) == 3
+
+    def test_queue_cap_can_reject_v3(self):
+        self.app.conf.task_protocol_negotiation = 'reject'
+        self.app.conf.task_queue_protocols = {'celery': 2}
+
+        with pytest.raises(TaskProtocolError, match='version_mismatch'):
+            self.app.amqp.resolve_task_protocol(
+                {'task_protocol': 3, 'queue': 'celery'},
+            )
+
+    def test_unknown_producer_protocol_is_rejected(self):
+        with pytest.raises(TaskProtocolError, match='unsupported_version'):
+            self.app.amqp.resolve_task_protocol({'task_protocol': 99})
+
+    def test_send_task_publishes_negotiated_v3(self):
+        producer = Mock()
+        producer.publish = Mock()
+        self.app.amqp.send_task_message(
+            producer, 'foo',
+            self.app.amqp.as_task_v3('task-id', 'foo', args=(1,)),
+            retry=False,
+        )
+
+        kwargs = producer.publish.call_args.kwargs
+        assert kwargs['headers']['task_protocol'] == 3
+        assert producer.publish.call_args.args[0][0] == 'celery_protocol3'
+
+    def test_send_task_message_rejects_unknown_serializer(self):
+        producer = Mock()
+
+        with pytest.raises(TaskProtocolError, match='serializer_unknown'):
+            self.app.amqp.send_task_message(
+                producer, 'foo',
+                self.app.amqp.as_task_v2('task-id', 'foo'),
+                serializer='does-not-exist', retry=False,
+            )
+
+        producer.publish.assert_not_called()

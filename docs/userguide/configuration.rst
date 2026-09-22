@@ -400,9 +400,114 @@ The default is to send uncompressed messages.
 Default: 2 (since 4.0).
 
 Set the default task message protocol version used to send tasks.
-Supports protocols: 1 and 2.
+Supports protocols 1, 2 and 3; the default remains 2 during rollout.
 
 Protocol 2 is supported by 3.1.24 and 4.x+.
+
+Protocol 3 is opt-in and uses the same transport headers as protocol 2,
+but wraps the body in an explicit envelope:
+
+.. code-block:: python
+
+    ("celery_protocol3", args, kwargs, embed)
+
+Select 3 per task or call with ``task_protocol=3``, or per queue with
+:setting:`task_queue_protocols`. Workers only accept the configured
+:setting:`task_protocol_min`/`:setting:`task_protocol_max` range; incompatible
+messages are rejected before task arguments are bound.
+
+.. setting:: task_protocol_min
+
+``task_protocol_min``
+~~~~~~~~~~~~~~~~~~~~~
+
+Default: 1.
+
+Lowest task protocol version accepted by this worker.
+
+.. setting:: task_protocol_max
+
+``task_protocol_max``
+~~~~~~~~~~~~~~~~~~~~~
+
+Default: 3.
+
+Highest task protocol version accepted by this worker.
+
+.. setting:: task_queue_protocols
+
+``task_queue_protocols``
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``{}``.
+
+Maps queue names to the highest protocol version consumers of that queue are
+known to support. When a producer requests a newer version, it is downgraded
+by default; set :setting:`task_protocol_negotiation` to ``"reject"`` to fail
+publishing instead.
+
+.. setting:: task_protocol_negotiation
+
+``task_protocol_negotiation``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``"downgrade"``.
+
+Producer policy when a requested task protocol is newer than a queue cap.
+Use ``"downgrade"`` for mixed-version rollout or ``"reject"`` for strict
+per-queue compatibility.
+
+.. setting:: task_protocol_incompatible_action
+
+``task_protocol_incompatible_action``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``"reject"``.
+
+Action for malformed or incompatible task messages: ``"reject"`` sends the
+message to the broker dead-letter policy (or discards it when none is
+configured), ``"requeue"`` requests redelivery, and ``"dead-letter"``
+republishes it to :setting:`task_protocol_dead_letter_exchange`.
+
+.. setting:: task_protocol_requeue
+
+``task_protocol_requeue``
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: :const:`False`.
+
+When :setting:`task_protocol_incompatible_action` is ``"reject"``, set this
+to :const:`True` to redeliver the message instead. Broker-level retry and
+connection retry policies remain separate.
+
+.. setting:: task_protocol_dead_letter_exchange
+
+``task_protocol_dead_letter_exchange``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: :const:`None`.
+
+Exchange used when the incompatible-message action is ``"dead-letter"``.
+
+.. setting:: task_protocol_dead_letter_routing_key
+
+``task_protocol_dead_letter_routing_key``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: :const:`None`.
+
+Routing key used for explicit protocol dead-letter publishes.
+
+.. setting:: task_protocol_strict_headers
+
+``task_protocol_strict_headers``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: :const:`False`.
+
+Reject unknown protocol 2 headers in addition to the always-strict protocol
+3 envelope. ``x-`` prefixed broker headers and stamped headers remain
+allowed.
 
 .. setting:: task_serializer
 

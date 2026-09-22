@@ -22,9 +22,14 @@ from kombu.utils.limits import TokenBucket
 from vine import ppartial, promise
 
 from celery import bootsteps, signals
+from celery.app.task_protocol import (SUPPORTED_TASK_PROTOCOLS,
+                                      task_protocol_from_headers,
+                                      validate_content_type_before_decode,
+                                      validate_decoded_body,
+                                      validate_headers_before_decode)
 from celery.app.trace import build_tracer
-from celery.exceptions import (CPendingDeprecationWarning, InvalidTaskError, NotRegistered, WorkerShutdown,
-                               WorkerTerminate)
+from celery.exceptions import (CPendingDeprecationWarning, InvalidTaskError, NotRegistered,
+                               TaskProtocolError, WorkerShutdown, WorkerTerminate)
 from celery.utils.functional import noop
 from celery.utils.log import get_logger
 from celery.utils.nodenames import gethostname
@@ -515,9 +520,6 @@ class Consumer:
     def on_decode_error(self, message, exc):
         """Callback called if an error occurs while decoding a message.
 
-        Simply logs the error and acknowledges the message so it
-        doesn't enter a loop.
-
         Arguments:
             message (kombu.Message): The message received.
             exc (Exception): The exception being handled.
@@ -526,7 +528,14 @@ class Consumer:
              exc, message.content_type, message.content_encoding,
              safe_repr(message.headers), dump_body(message, message.body),
              exc_info=1)
-        message.ack()
+        reason = 'serializer_error'
+        if not isinstance(exc, TaskProtocolError):
+            exc = TaskProtocolError(
+                reason, detail=str(exc), protocol=task_protocol_from_headers(
+                    message.headers,
+                ), stage='decode',
+            )
+        self.on_task_protocol_error(message, exc)
 
     def on_close(self):
         # Clear internal queues to get rid of old messages.
@@ -693,6 +702,99 @@ class Consumer:
                                      safe_repr(message.delivery_info),
                                      safe_repr(message.headers))
 
+    @property
+    def accepted_task_protocols(self):
+        conf = self.app.conf
+        return frozenset(range(
+            conf.task_protocol_min, conf.task_protocol_max + 1,
+        )) & SUPPORTED_TASK_PROTOCOLS
+
+    def send_task_protocol_event(self, message, exc):
+        if self.event_dispatcher:
+            headers = message.headers or {}
+            self.event_dispatcher.send(
+                'task-protocol-rejected',
+                uuid=headers.get('id'),
+                name=headers.get('task'),
+                protocol=getattr(exc, 'protocol', None),
+                reason=getattr(exc, 'reason', 'protocol_error'),
+                stage=getattr(exc, 'stage', 'decode'),
+                action=self.app.conf.task_protocol_incompatible_action,
+                detail=str(exc),
+            )
+
+    def on_task_protocol_error(self, message, exc):
+        """Reject an incompatible task using the configured policy."""
+        conf = self.app.conf
+        action = conf.task_protocol_incompatible_action
+        headers = {
+            key: value for key, value in (message.headers or {}).items()
+            if key != 'compression'
+        }
+        headers.update({
+            'x-celery-task-protocol': getattr(exc, 'protocol', None),
+            'x-celery-reject-reason': getattr(exc, 'reason', 'protocol_error'),
+            'x-celery-reject-stage': getattr(exc, 'stage', 'decode'),
+        })
+
+        error(
+            'Rejecting task message: reason=%s protocol=%s stage=%s detail=%s',
+            getattr(exc, 'reason', 'protocol_error'),
+            getattr(exc, 'protocol', None),
+            getattr(exc, 'stage', 'decode'),
+            exc,
+        )
+        self.send_task_protocol_event(message, exc)
+        signals.task_rejected.send(
+            sender=self, message=message, exc=exc, action=action,
+        )
+
+        if action == 'requeue' or (
+            action == 'reject' and conf.task_protocol_requeue
+        ):
+            message.reject_log_error(
+                logger, self.connection_errors, requeue=True,
+            )
+            return
+        if action == 'dead-letter':
+            try:
+                self.publish_task_protocol_dead_letter(message, headers)
+            except Exception as dead_letter_exc:  # pylint: disable=broad-except
+                logger.critical(
+                    "Couldn't publish incompatible task to dead-letter exchange, "
+                    're-queuing: %r', dead_letter_exc, exc_info=True,
+                )
+                message.reject_log_error(
+                    logger, self.connection_errors, requeue=True,
+                )
+                return
+            message.ack_log_error(logger, self.connection_errors)
+            return
+
+        message.reject_log_error(logger, self.connection_errors, requeue=False)
+
+    def publish_task_protocol_dead_letter(self, message, headers):
+        conf = self.app.conf
+        exchange = conf.task_protocol_dead_letter_exchange
+        if not exchange:
+            raise ValueError('task_protocol_dead_letter_exchange is not configured')
+        routing_key = conf.task_protocol_dead_letter_routing_key
+        properties = {
+            key: value for key, value in (message.properties or {}).items()
+            if key != 'delivery_mode'
+        }
+        with self.app.amqp.Producer(self.connection, auto_declare=False) as producer:
+            producer.publish(
+                message.body,
+                exchange=exchange,
+                routing_key=routing_key,
+                content_type=message.content_type,
+                content_encoding=message.content_encoding,
+                headers=headers,
+                retry=False,
+                **properties,
+            )
+
     def on_unknown_message(self, body, message):
         warn(UNKNOWN_FORMAT, self._message_report(body, message))
         message.reject_log_error(logger, self.connection_errors)
@@ -734,8 +836,13 @@ class Consumer:
     def on_invalid_task(self, body, message, exc):
         error(INVALID_TASK_ERROR, exc, dump_body(message, body),
               exc_info=True)
-        message.reject_log_error(logger, self.connection_errors)
-        signals.task_rejected.send(sender=self, message=message, exc=exc)
+        if not isinstance(exc, TaskProtocolError):
+            exc = TaskProtocolError(
+                'invalid_field', detail=str(exc),
+                protocol=task_protocol_from_headers(message.headers),
+                stage='decode',
+            )
+        self.on_task_protocol_error(message, exc)
 
     def update_strategies(self):
         loader = self.app.loader
@@ -757,6 +864,17 @@ class Consumer:
             # will defer deserializing the message body to the pool.
             payload = None
             try:
+                protocol = validate_headers_before_decode(
+                    message.headers,
+                    accepted_protocols=set(self.accepted_task_protocols),
+                    strict_headers=self.app.conf.task_protocol_strict_headers,
+                )
+                validate_content_type_before_decode(
+                    message, protocol,
+                )
+            except TaskProtocolError as exc:
+                return on_invalid_task(None, message, exc)
+            try:
                 type_ = message.headers['task']  # protocol v2
             except TypeError:
                 return on_unknown_message(None, message)
@@ -766,7 +884,13 @@ class Consumer:
                 except Exception as exc:  # pylint: disable=broad-except
                     return self.on_decode_error(message, exc)
                 try:
+                    validate_decoded_body(
+                        payload, protocol,
+                        strict_headers=self.app.conf.task_protocol_strict_headers,
+                    )
                     type_, payload = payload['task'], payload  # protocol v1
+                except TaskProtocolError as exc:
+                    return on_invalid_task(payload, message, exc)
                 except (TypeError, KeyError):
                     return on_unknown_message(payload, message)
             try:
@@ -802,7 +926,7 @@ class Consumer:
                         reject_log_error_promise,
                         callbacks,
                     )
-                except (InvalidTaskError, ContentDisallowed) as exc:
+                except (InvalidTaskError, ContentDisallowed, TaskProtocolError, ValueError) as exc:
                     return on_invalid_task(payload, message, exc)
                 except DecodeError as exc:
                     return self.on_decode_error(message, exc)

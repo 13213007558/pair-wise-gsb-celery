@@ -16,10 +16,11 @@ from kombu.utils.objects import cached_property
 
 from celery import current_app, signals, states
 from celery.app.task import Context
+from celery.app.task_protocol import TASK_PROTOCOL_HEADER, validate_decoded_body
 from celery.app.trace import fast_trace_task, task_has_custom, trace_task, trace_task_ret
 from celery.concurrency.base import BasePool
-from celery.exceptions import (Ignore, InvalidTaskError, Reject, Retry, TaskRevokedError, Terminated,
-                               TimeLimitExceeded, WorkerLostError)
+from celery.exceptions import (Ignore, InvalidTaskError, Reject, Retry, TaskRevokedError,
+                               Terminated, TimeLimitExceeded, WorkerLostError)
 from celery.platforms import signals as _signals
 from celery.utils.functional import maybe, maybe_list, noop
 from celery.utils.log import get_logger
@@ -113,7 +114,14 @@ class Request:
             self._content_type, self._content_encoding = (
                 message.content_type, message.content_encoding,
             )
-        self.__payload = self._body if self._decoded else message.payload
+        protocol = self._request_dict.get(TASK_PROTOCOL_HEADER, 2)
+        if self._decoded:
+            payload = self._body
+            validate_decoded_body(payload, 2)
+        else:
+            payload = message.payload
+            validate_decoded_body(payload, protocol)
+        self.__payload = payload
         self.id = self._request_dict['id']
         self._type = self.name = self._request_dict['task']
         if 'shadow' in self._request_dict:

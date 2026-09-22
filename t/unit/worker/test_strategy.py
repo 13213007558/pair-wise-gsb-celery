@@ -7,12 +7,12 @@ from kombu.utils.limits import TokenBucket
 
 from celery import Task, signals
 from celery.app.trace import LOG_RECEIVED
-from celery.exceptions import InvalidTaskError
+from celery.exceptions import InvalidTaskError, TaskProtocolError
 from celery.utils.time import rate
 from celery.worker import state
 from celery.worker.request import Request
 from celery.worker.strategy import default as default_strategy
-from celery.worker.strategy import hybrid_to_proto2, proto1_to_proto2
+from celery.worker.strategy import hybrid_to_proto2, proto1_to_proto2, proto3_to_proto2
 
 
 class test_proto1_to_proto2:
@@ -53,6 +53,35 @@ class test_proto1_to_proto2:
         assert headers == dict(self.body, group='123')
         assert decoded
         assert not utc
+
+
+class test_proto3_to_proto2:
+
+    def test_converts_envelope_to_internal_v2_shape(self):
+        message = Mock(headers={'task_protocol': 3})
+        body = ('celery_protocol3', (1,), {'foo': 'baz'}, {'chord': None})
+
+        converted, headers, decoded, utc = proto3_to_proto2(message, body)
+
+        assert converted == ((1,), {'foo': 'baz'}, {'chord': None})
+        assert headers['task_protocol'] == 3
+        assert decoded
+        assert utc
+
+    def test_rejects_bad_marker_without_partial_args(self):
+        message = Mock(headers={'task_protocol': 3})
+
+        with pytest.raises(TaskProtocolError, match='unsupported_version'):
+            proto3_to_proto2(message, ('celery_protocol2', None, None, None))
+
+    def test_rejects_invalid_kwargs(self):
+        message = Mock(headers={'task_protocol': 3})
+
+        with pytest.raises(InvalidTaskError):
+            proto3_to_proto2(
+                message,
+                ('celery_protocol3', (), [], None),
+            )
 
 
 class test_default_strategy_proto2:

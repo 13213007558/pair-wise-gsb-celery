@@ -502,6 +502,40 @@ You can handle this error too:
 
 .. _calling-serializers:
 
+.. _calling-protocols:
+
+Protocols
+=========
+
+The default task protocol is 2. Select protocol 3 for one task call, one task
+class, or a routed queue during a mixed-version rollout:
+
+.. code-block:: python
+
+    add.apply_async((2, 2), task_protocol=3)
+
+    @app.task(task_protocol=3)
+    def add(x, y):
+        return x + y
+
+    app.conf.task_queue_protocols = {'legacy': 2, 'modern': 3}
+
+Producers acquired from a pool and passed to ``app.send_task(producer=...)`` or
+``Task.apply_async(producer=...)`` use the same policy as a normal synchronous
+call. Queue negotiation happens before ``Producer.publish``; publisher retry
+only resends the already encoded, negotiated message, and reconnecting a
+producer cannot raise the negotiated version. Use
+``task_protocol_negotiation = "reject"`` if publishing must fail instead of
+downgrading to a queue's supported version. Calling ``Producer.publish``
+directly bypasses Celery's negotiation and is only appropriate when the caller
+implements the same queue compatibility checks.
+
+Workers reject messages outside their configured protocol range, messages with
+missing or unknown required envelope fields, and disallowed or unreadable
+serializers before invoking the task. Retries and connection recovery are not
+protocol negotiation: they must preserve the original id, root/parent ids,
+stamps, serializer, ETA, expiry and retry count.
+
 Serializers
 ===========
 

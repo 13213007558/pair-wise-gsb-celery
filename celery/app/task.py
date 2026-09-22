@@ -32,7 +32,7 @@ _UNSET = object()
 extract_exec_options = mattrgetter(
     'queue', 'routing_key', 'exchange', 'priority', 'expires',
     'serializer', 'delivery_mode', 'compression', 'time_limit',
-    'soft_time_limit', 'immediate', 'mandatory',  # imm+man is deprecated
+    'soft_time_limit', 'task_protocol', 'immediate', 'mandatory',  # imm+man is deprecated
 )
 
 # We take __repr__ very seriously around here ;)
@@ -109,6 +109,7 @@ class Context:
     timelimit = None
     time_limit = None
     soft_time_limit = None
+    task_protocol = None
     utc = None
     stamped_headers = None
     stamps = None
@@ -186,7 +187,10 @@ class Context:
             'reply_to': self.reply_to,
             'replaced_task_nesting': self.replaced_task_nesting,
             'origin': self.origin,
+            'task_protocol': self.get('task_protocol'),
         }
+        if execution_options['task_protocol'] is None:
+            execution_options.pop('task_protocol')
         if hasattr(self, 'stamps') and hasattr(self, 'stamped_headers'):
             if self.stamps is not None and self.stamped_headers is not None:
                 execution_options['stamped_headers'] = self.stamped_headers
@@ -274,6 +278,10 @@ class Task:
     #: The name of a serializer that are registered with
     #: :mod:`kombu.serialization.registry`.  Default is `'json'`.
     serializer = None
+
+    #: Task message protocol used by this task. ``None`` uses
+    #: :setting:`task_protocol`.
+    task_protocol = None
 
     #: Hard time limit.
     #: Defaults to the :setting:`task_time_limit` setting.
@@ -685,6 +693,8 @@ class Task:
 
         preopts = self._get_exec_options()
         options = dict(preopts, **options)
+        if options.get('task_protocol') is None:
+            options.pop('task_protocol', None)
 
         options.setdefault('ignore_result', self.ignore_result)
         if self.priority:
@@ -917,6 +927,7 @@ class Task:
         request = {
             'id': task_id,
             'task': self.name,
+            'task_protocol': 1,
             'parent_id': parent_id,
             'root_id': root_id,
             'retries': retries,

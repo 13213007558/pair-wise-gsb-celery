@@ -442,6 +442,12 @@ Provides arguments:
 
     The error that occurred (if any).
 
+* ``action``
+
+    Configured incompatible-message action (``reject``, ``requeue`` or
+    ``dead-letter``) for protocol failures. Generic task rejections may not
+    provide this argument.
+
 App Signals
 -----------
 

@@ -80,7 +80,7 @@ __all__ = (
     'TaskError', 'QueueNotFound', 'IncompleteStream',
     'NotRegistered', 'AlreadyRegistered', 'TimeoutError',
     'MaxRetriesExceededError', 'TaskRevokedError',
-    'InvalidTaskError', 'ChordError',
+    'InvalidTaskError', 'TaskProtocolError', 'ChordError',
 
     # Backend related errors.
     'BackendError', 'BackendGetMetaError', 'BackendStoreError',
@@ -260,6 +260,20 @@ class TaskRevokedError(TaskError):
 
 class InvalidTaskError(TaskError):
     """The task has invalid data or ain't properly constructed."""
+
+
+class TaskProtocolError(InvalidTaskError):
+    """A task message is incompatible with the negotiated protocol."""
+
+    def __init__(self, reason, detail=None, protocol=None, stage=None):
+        self.reason = reason
+        self.detail = detail
+        self.protocol = protocol
+        self.stage = stage or 'decode'
+        message = f'incompatible task protocol ({reason})'
+        if detail:
+            message = f'{message}: {detail}'
+        super().__init__(message)
 
 
 class ChordError(TaskError):

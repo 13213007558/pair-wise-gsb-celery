@@ -757,6 +757,17 @@ task-rejected
 The task was rejected by the worker, possibly to be re-queued or moved to a
 dead letter queue.
 
+.. event:: task-protocol-rejected
+
+task-protocol-rejected
+~~~~~~~~~~~~~~~~~~~~~~
+
+:signature: ``task-protocol-rejected(uuid, name, protocol, reason, stage,
+              action, detail)``
+
+The task was rejected before execution because its protocol version, required
+fields, serializer, or decoded envelope was incompatible with this worker.
+
 .. event:: task-revoked
 
 task-revoked
