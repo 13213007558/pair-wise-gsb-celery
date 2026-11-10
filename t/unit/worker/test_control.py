@@ -19,7 +19,7 @@ from celery.worker import consumer, control
 from celery.worker import state as worker_state
 from celery.worker.pidbox import Pidbox, gPidbox
 from celery.worker.request import Request
-from celery.worker.state import REVOKE_EXPIRES, revoked, revoked_stamps
+from celery.worker.state import REVOKE_EXPIRES, revoked, revoked_selectors, revoked_stamps
 
 hostname = socket.gethostname()
 
@@ -1251,3 +1251,148 @@ class test_ControlPanel:
         finally:
             worker_state.active_requests.clear()
             worker_state.revoked_stamps.clear()
+
+    def _make_stamped_request(self, task_id, stamps):
+        request = Mock()
+        request.id = task_id
+        request.stamps = stamps
+        request.terminate = Mock()
+        return request
+
+    def test_revoke_by_stamped_selectors_terminates_only_intersection(self):
+        """Only tasks matching ALL selector fields are terminated/revoked."""
+        state = self.create_state()
+        state.consumer = Mock()
+
+        combos = [
+            ('A', 7, True),
+            ('A', 8, False),
+            ('B', 7, False),
+            ('B', 8, False),
+        ]
+        requests = [
+            self._make_stamped_request(
+                f'task-{tenant}-{batch}',
+                {'tenant': tenant, 'export_batch': batch},
+            )
+            for tenant, batch, _ in combos
+        ]
+        for request in requests:
+            worker_state.active_requests.add(request)
+
+        try:
+            with patch('celery.worker.control._signals.signum', return_value=15):
+                result = control.revoke_by_stamped_selectors(
+                    state,
+                    [{'tenant': 'A', 'export_batch': 7}],
+                    terminate=True,
+                )
+
+            for request, (_, _, should_terminate) in zip(requests, combos):
+                if should_terminate:
+                    request.terminate.assert_called_once()
+                else:
+                    request.terminate.assert_not_called()
+            assert 'revoked 1 running tasks' in result['ok']
+
+            # the selector is stored whole, not split into revoked_stamps
+            assert len(worker_state.revoked_selectors) == 1
+            assert not worker_state.revoked_stamps
+        finally:
+            worker_state.active_requests.clear()
+            worker_state.revoked_selectors.clear()
+            worker_state.revoked_stamps.clear()
+
+    def test_revoke_by_stamped_selectors_without_terminate(self):
+        state = self.create_state()
+        state.consumer = Mock()
+        try:
+            result = control.revoke_by_stamped_selectors(
+                state, {'tenant': 'A', 'export_batch': 7})
+            assert 'flagged as revoked, but not terminated' in result['ok']
+            assert len(worker_state.revoked_selectors) == 1
+        finally:
+            worker_state.revoked_selectors.clear()
+
+    def test_revoke_by_stamped_selectors_repeated_registration_idempotent(self):
+        state = self.create_state()
+        state.consumer = Mock()
+        selector = {'tenant': 'A', 'export_batch': 7}
+        try:
+            control.revoke_by_stamped_selectors(state, [selector])
+            control.revoke_by_stamped_selectors(state, [selector])
+            control.revoke_by_stamped_selectors(
+                state, [{'tenant': ['A'], 'export_batch': [7]}])
+            assert len(worker_state.revoked_selectors) == 1
+        finally:
+            worker_state.revoked_selectors.clear()
+
+    def test_revoke_by_stamped_selectors_clear(self):
+        state = self.create_state()
+        state.consumer = Mock()
+        first = {'tenant': 'A', 'export_batch': 7}
+        second = {'tenant': 'B', 'export_batch': 8}
+        try:
+            control.revoke_by_stamped_selectors(state, [first, second])
+            assert len(worker_state.revoked_selectors) == 2
+
+            r = control.revoke_by_stamped_selectors(
+                state, [first], clear=True)
+            assert 'removed 1 of 1' in r['ok']
+            assert len(worker_state.revoked_selectors) == 1
+
+            # clearing an unregistered selector is a no-op
+            r = control.revoke_by_stamped_selectors(
+                state, [first], clear=True)
+            assert 'removed 0 of 1' in r['ok']
+            assert len(worker_state.revoked_selectors) == 1
+
+            # clearing with no selectors removes everything
+            r = control.revoke_by_stamped_selectors(state, [], clear=True)
+            assert 'cleared all 1' in r['ok']
+            assert not worker_state.revoked_selectors
+        finally:
+            worker_state.revoked_selectors.clear()
+
+    def test_revoke_by_stamped_selectors_rejects_empty_selector(self):
+        state = self.create_state()
+        state.consumer = Mock()
+        with pytest.raises(ValueError):
+            control.revoke_by_stamped_selectors(state, [{}])
+        assert not worker_state.revoked_selectors
+
+    def test_revoke_by_stamped_selectors_rejects_unsupported_value(self):
+        state = self.create_state()
+        state.consumer = Mock()
+        with pytest.raises(TypeError):
+            control.revoke_by_stamped_selectors(
+                state, [{'tenant': {'nested': 'mapping'}}])
+        assert not worker_state.revoked_selectors
+
+    def test_revoke_by_stamped_selectors_requires_a_selector(self):
+        state = self.create_state()
+        state.consumer = Mock()
+        with pytest.raises(ValueError):
+            control.revoke_by_stamped_selectors(state, [])
+
+    def test_revoke_by_stamped_selectors_missing_field_not_terminated(self):
+        """A task missing a selector field is not terminated."""
+        state = self.create_state()
+        state.consumer = Mock()
+
+        request = self._make_stamped_request(
+            'task-missing-field', {'tenant': 'A'})
+        worker_state.active_requests.add(request)
+
+        try:
+            with patch('celery.worker.control._signals.signum', return_value=15):
+                result = control.revoke_by_stamped_selectors(
+                    state,
+                    [{'tenant': 'A', 'export_batch': 7}],
+                    terminate=True,
+                )
+            request.terminate.assert_not_called()
+            assert 'were not terminated' in result['ok']
+        finally:
+            worker_state.active_requests.clear()
+            worker_state.revoked_selectors.clear()

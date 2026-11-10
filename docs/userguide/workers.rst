@@ -765,6 +765,67 @@ and all of the tasks that have a stamped header ``header_B`` with values ``value
 
     $ celery -A proj control revoke_by_stamped_headers stamped_header_key_A=stamped_header_value_1 stamped_header_key_B=stamped_header_value_2 --terminate --signal=SIGKILL
 
+.. control:: revoke_by_stamped_selectors
+
+``revoke_by_stamped_selectors``: Revoking tasks matching ALL stamped headers of a selector
+------------------------------------------------------------------------------------------
+:pool support: all, terminate only supported by prefork and eventlet
+:broker support: *amqp, redis*
+
+.. versionadded:: 5.7
+
+This command is similar to :meth:`~@control.revoke_by_stamped_headers`, but
+each *selector* is a conjunction: a task is revoked only when **all** of the
+selector's fields match its stamped headers, while any single matching
+selector is enough.  List values match when they share at least one element.
+
+Use it to revoke exactly an intersection, e.g. the tasks of tenant ``A``
+**and** export batch ``7``, without also revoking other batches of the same
+tenant (which ``revoke_by_stamped_headers`` would do, since every header
+there is an independent condition):
+
+**Example**
+
+.. code-block:: pycon
+
+    >>> app.control.revoke_by_stamped_selectors([
+    ...     {'tenant': 'A', 'export_batch': 7},
+    ... ])
+
+    >>> app.control.revoke_by_stamped_selectors(
+    ...     [{'tenant': 'A', 'export_batch': 7}], terminate=True)
+
+Registered selectors are stored whole on the worker (they are never split
+into the independent per-header keys used by ``revoke_by_stamped_headers``),
+and registering the same selector twice is idempotent.  To remove registered
+selectors, pass them again with ``clear=True``; an empty list clears all
+registered selectors:
+
+.. code-block:: pycon
+
+    >>> app.control.revoke_by_stamped_selectors(
+    ...     [{'tenant': 'A', 'export_batch': 7}], clear=True)
+
+    >>> app.control.revoke_by_stamped_selectors([], clear=True)
+
+An empty selector is rejected (it would match every task), a task missing a
+selector field never matches it, and values must be ``str``/``int``/``float``/
+``bool`` or lists of those.
+
+.. warning::
+
+    The registered selectors are not persistent across restarts, so if you
+    restart the workers, the selectors will be lost and need to be
+    registered again.
+
+.. warning::
+
+    Stamped headers are labels for *selecting* tasks, not credentials.
+    Their trustworthiness depends entirely on the producer that set them
+    and on the permissions guarding message ingress (who may publish to
+    the broker and set headers); never treat them as proof of identity or
+    authorization on their own.
+
 .. _worker-time-limits:
 
 Time Limits

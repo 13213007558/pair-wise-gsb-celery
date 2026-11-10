@@ -112,6 +112,90 @@ revoked = LimitedSet(maxlen=REVOKES_MAX, expires=REVOKE_EXPIRES)
 #: Mapping of stamped headers flagged for revoking.
 revoked_stamps = {}
 
+#: Mapping of stamped-header selectors flagged for revoking.
+#:
+#: Each selector is a conjunction: a task is revoked only when *all* of
+#: the selector's fields match its stamped headers (list values match on
+#: any common element), while any single matching selector is enough.
+#: Selectors are stored whole, keyed by :func:`revoke_selector_key`, and
+#: are never split into :data:`revoked_stamps` keys: doing so would turn
+#: the conjunction into a disjunction and revoke tasks outside the
+#: intended intersection (e.g. other batches of the same tenant).
+revoked_selectors = {}
+
+
+def normalize_revoke_selector(selector):
+    """Validate and normalize a stamped-header revoke selector.
+
+    Returns a mapping of header name to a :class:`frozenset` of accepted
+    values.  A scalar value is treated as a single-element list.
+
+    Raises:
+        TypeError: if the selector is not a mapping, a header name is
+            not a string, or a value is not a ``str``/``int``/``float``/
+            ``bool`` (or a list/tuple/set of those).
+        ValueError: if the selector is empty.  An empty selector would
+            match every task, so it is rejected instead.
+    """
+    if not isinstance(selector, dict):
+        raise TypeError(
+            'revoke selector must be a mapping of stamped header names '
+            f'to values, got {type(selector).__name__!r}')
+    if not selector:
+        raise ValueError(
+            'revoke selector must not be empty: '
+            'an empty selector would match every task')
+    normalized = {}
+    for header, value in selector.items():
+        if not isinstance(header, str):
+            raise TypeError(
+                f'revoke selector header names must be strings, '
+                f'got {header!r}')
+        values = list(value) if isinstance(
+            value, (list, tuple, set, frozenset)) else [value]
+        for item in values:
+            if not isinstance(item, (str, int, float, bool)):
+                raise TypeError(
+                    f'unsupported stamp value {item!r} for header '
+                    f'{header!r}: expected str, int, float or bool, '
+                    f'or a list/tuple/set of those')
+        normalized[header] = frozenset(values)
+    return normalized
+
+
+def revoke_selector_key(normalized_selector):
+    """Hashable key of a normalized revoke selector.
+
+    Used to register a selector in :data:`revoked_selectors` so that
+    registering the same selector twice is idempotent and so a registered
+    selector can be removed again.
+    """
+    return frozenset(normalized_selector.items())
+
+
+def stamped_headers_match_selector(stamps, normalized_selector):
+    """Return True if the stamped headers satisfy every selector field.
+
+    A field matches when the task carries the header and its value shares
+    at least one element with the selector values (a scalar value is
+    treated as a single-element list).  A header missing from the task,
+    or set to None, never matches, and neither does a selector field with
+    no accepted values.
+    """
+    for header, expected in normalized_selector.items():
+        actual = stamps.get(header)
+        if actual is None:
+            return False
+        actual_values = actual if isinstance(
+            actual, (list, tuple, set, frozenset)) else [actual]
+        try:
+            if not expected.intersection(actual_values):
+                return False
+        except TypeError:
+            # unhashable stamped value cannot share an element
+            return False
+    return True
+
 
 def merge_revoked(task_ids):
     """Add task ids revoked elsewhere: on another worker, or before a restart.
@@ -152,6 +236,7 @@ def reset_state():
     all_total_count[:] = [0]
     revoked.clear()
     revoked_stamps.clear()
+    revoked_selectors.clear()
 
 
 def maybe_shutdown():

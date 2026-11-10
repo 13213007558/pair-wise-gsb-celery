@@ -469,6 +469,47 @@ class test_Control:
             _options={'limit': 404},
         )
 
+    def test_revoke_by_stamped_selectors(self):
+        self.app.control.revoke_by_stamped_selectors(
+            [{'tenant': 'A', 'export_batch': 7}])
+        self.assert_control_called_with_args(
+            'revoke_by_stamped_selectors',
+            destination=None,
+            selectors=[{'tenant': 'A', 'export_batch': 7}],
+            signal=control.TERM_SIGNAME,
+            terminate=False,
+            clear=False,
+        )
+
+    def test_revoke_by_stamped_selectors__with_options(self):
+        self.app.control.revoke_by_stamped_selectors(
+            [{'tenant': 'A', 'export_batch': 7}],
+            destination='a@q.com',
+            terminate=True,
+            signal='KILL',
+            limit=404,
+        )
+        self.assert_control_called_with_args(
+            'revoke_by_stamped_selectors',
+            destination='a@q.com',
+            selectors=[{'tenant': 'A', 'export_batch': 7}],
+            signal='KILL',
+            terminate=True,
+            clear=False,
+            _options={'limit': 404},
+        )
+
+    def test_revoke_by_stamped_selectors__clear(self):
+        self.app.control.revoke_by_stamped_selectors([], clear=True)
+        self.assert_control_called_with_args(
+            'revoke_by_stamped_selectors',
+            destination=None,
+            selectors=[],
+            signal=control.TERM_SIGNAME,
+            terminate=False,
+            clear=True,
+        )
+
     def test_election(self):
         self.app.control.election('some_id', 'topic', 'action')
         self.assert_control_called_with_args(

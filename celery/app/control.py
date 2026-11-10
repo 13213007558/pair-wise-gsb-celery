@@ -545,6 +545,39 @@ class Control:
         else:
             return result
 
+    def revoke_by_stamped_selectors(self, selectors, destination=None, terminate=False,
+                                    signal=TERM_SIGNAME, clear=False, **kwargs):
+        """Tell all (or specific) workers to revoke tasks matching all fields of a selector.
+
+        Unlike :meth:`revoke_by_stamped_headers`, where every header is an
+        independent condition, each selector here is a conjunction: a task
+        is revoked only when *all* of the selector's fields match its
+        stamped headers (list values match on any common element), while
+        any single matching selector is enough.  This revokes exactly the
+        intersection, e.g. ``tenant=A`` *and* ``export_batch=7``, without
+        touching other batches of the same tenant.
+
+        Arguments:
+            selectors (Union[dict, list[dict]]): A selector (mapping of
+                stamped header names to values) or a list of selectors.
+            terminate (bool): Also terminate the process currently working
+                on the task (if any).
+            signal (str): Name of signal to send to process if terminate.
+                Default is TERM.
+            clear (bool): Remove the given selectors from the workers'
+                registry instead of adding them.  With an empty list,
+                removes all registered selectors.
+
+        See Also:
+            :meth:`broadcast` for supported keyword arguments.
+        """
+        return self.broadcast('revoke_by_stamped_selectors', destination=destination, arguments={
+            'selectors': selectors,
+            'terminate': terminate,
+            'signal': signal,
+            'clear': clear,
+        }, **kwargs)
+
     def terminate(self, task_id,
                   destination=None, signal=TERM_SIGNAME, **kwargs):
         """Tell all (or specific) workers to terminate a task by id (or list of ids).

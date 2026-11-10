@@ -218,6 +218,80 @@ def revoke_by_stamped_headers(state, headers, terminate=False, signal=None, **kw
     return ok(f'headers {terminated_scheme_to_stamps_mapping} revoked')
 
 
+@control_command(
+    signature='<selector1> [selector2 [... [selectorN]]]',
+)
+def revoke_by_stamped_selectors(state, selectors, terminate=False, signal=None, clear=False, **kwargs):
+    """Revoke tasks matching ALL stamped header fields of a selector.
+
+    Keyword Arguments:
+        selectors: A selector (mapping of stamped header names to values)
+                   or a list of selectors.  A task is revoked when every
+                   field of at least one registered selector matches its
+                   stamped headers; list values match on any common element.
+        terminate (bool): Also terminate the process if the task is active.
+        signal (str): Name of signal to use for terminate (e.g., ``KILL``).
+        clear (bool): Remove the given selectors from the registry instead
+                      of adding them.  With no selectors, removes all
+                      registered selectors.
+    Sample selectors input:
+        [{'tenant': 'A', 'export_batch': 7}]
+    """
+    # pylint: disable=redefined-outer-name
+    # XXX Note that this redefines `terminate`:
+    #     Outside of this scope that is a function.
+    signum = _signals.signum(signal or TERM_SIGNAME)
+
+    if selectors is None:
+        selectors = []
+    elif isinstance(selectors, dict):
+        selectors = [selectors]
+
+    normalized = [worker_state.normalize_revoke_selector(selector)
+                  for selector in selectors]
+
+    if clear:
+        if not normalized:
+            cleared = len(worker_state.revoked_selectors)
+            worker_state.revoked_selectors.clear()
+            return ok(f'cleared all {cleared} stamped header revoke selectors')
+        removed = 0
+        for selector in normalized:
+            key = worker_state.revoke_selector_key(selector)
+            if worker_state.revoked_selectors.pop(key, None) is not None:
+                removed += 1
+        return ok(f'removed {removed} of {len(normalized)} stamped header revoke selectors')
+
+    if not normalized:
+        raise ValueError(
+            'revoke_by_stamped_selectors requires at least one selector')
+
+    for selector in normalized:
+        worker_state.revoked_selectors[
+            worker_state.revoke_selector_key(selector)] = selector
+
+    if not terminate:
+        return ok(f'selectors {selectors} flagged as revoked, but not terminated')
+
+    terminated = 0
+
+    # Terminate all running tasks whose stamped headers satisfy every
+    # field of at least one of the given selectors.
+    for req in list(worker_state.active_requests):
+        stamps = getattr(req, 'stamps', None)
+        if not stamps:
+            continue
+        for selector in normalized:
+            if worker_state.stamped_headers_match_selector(stamps, selector):
+                req.terminate(state.consumer.pool, signal=signum)
+                terminated += 1
+                break
+
+    if not terminated:
+        return ok(f'selectors {selectors} were not terminated')
+    return ok(f'selectors {selectors} revoked {terminated} running tasks')
+
+
 def _revoke(state, task_ids, terminate=False, signal=None, **kwargs):
     size = len(task_ids)
     terminated = set()

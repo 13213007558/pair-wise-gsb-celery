@@ -63,6 +63,7 @@ task_accepted = state.task_accepted
 task_ready = state.task_ready
 revoked_tasks = state.revoked
 revoked_stamps = state.revoked_stamps
+revoked_selectors = state.revoked_selectors
 
 
 class Request:
@@ -506,6 +507,16 @@ class Request:
                         revoking_header = {stamp: stamped_header}
                     if revoked_by_header:
                         break
+
+        if not revoked_by_id and not revoked_by_header and self.stamps:
+            for selector in revoked_selectors.values():
+                if state.stamped_headers_match_selector(self.stamps, selector):
+                    revoked_by_header = True
+                    revoking_header = {
+                        header: sorted(values, key=repr)
+                        for header, values in selector.items()
+                    }
+                    break
 
         if any((expired, revoked_by_id, revoked_by_header)):
             log_msg = 'Discarding revoked task: %s[%s]'

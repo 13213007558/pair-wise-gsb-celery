@@ -24,7 +24,7 @@ from celery.worker import request as module
 from celery.worker import strategy
 from celery.worker.request import Request, create_request_cls
 from celery.worker.request import logger as req_logger
-from celery.worker.state import revoked, revoked_stamps
+from celery.worker.state import revoked, revoked_selectors, revoked_stamps
 
 
 class RequestCase:
@@ -1123,6 +1123,90 @@ class test_Request(RequestCase):
             assert job.revoked()
         finally:
             revoked_stamps.clear()
+
+    def _register_selector(self, selector):
+        from celery.worker import state as worker_state
+        normalized = worker_state.normalize_revoke_selector(selector)
+        revoked_selectors[worker_state.revoke_selector_key(normalized)] = normalized
+
+    @pytest.mark.parametrize("tenant,batch,expected", [
+        ('A', 7, True),
+        ('A', 8, False),
+        ('B', 7, False),
+        ('B', 8, False),
+    ])
+    def test_revoked_by_stamped_selector_requires_all_fields(
+            self, tenant, batch, expected):
+        """Only the intersection of all selector fields is revoked."""
+        revoked_selectors.clear()
+        revoked_stamps.clear()
+        try:
+            job = self.xRequest()
+            self._stamp(job, {'tenant': tenant, 'export_batch': batch})
+            self._register_selector({'tenant': 'A', 'export_batch': 7})
+            if expected:
+                with self.assert_signal_called(
+                        task_revoked, sender=job.task, request=job._context,
+                        terminated=False, expired=False, signum=None):
+                    assert job.revoked()
+                assert job._already_revoked
+                assert job.acknowledged
+            else:
+                assert not job.revoked()
+                assert not job._already_revoked
+        finally:
+            revoked_selectors.clear()
+
+    def test_revoked_by_stamped_selector_list_common_element(self):
+        """List-valued stamps match a selector field on any common element."""
+        revoked_selectors.clear()
+        try:
+            job = self.xRequest()
+            self._stamp(job, {'tenant': ['A', 'C'], 'export_batch': [6, 7]})
+            self._register_selector({'tenant': 'A', 'export_batch': [7, 9]})
+            assert job.revoked()
+            assert job._already_revoked
+        finally:
+            revoked_selectors.clear()
+
+    def test_not_revoked_by_stamped_selector_with_missing_field(self):
+        """A task missing a selector field is never revoked by it."""
+        revoked_selectors.clear()
+        try:
+            job = self.xRequest()
+            self._stamp(job, {'tenant': 'A'})
+            self._register_selector({'tenant': 'A', 'export_batch': 7})
+            assert not job.revoked()
+            assert not job._already_revoked
+        finally:
+            revoked_selectors.clear()
+
+    def test_revoked_by_any_of_multiple_selectors(self):
+        """Selectors are disjunctive: any single matching selector revokes."""
+        revoked_selectors.clear()
+        try:
+            job = self.xRequest()
+            self._stamp(job, {'tenant': 'B', 'export_batch': 7})
+            self._register_selector({'tenant': 'A', 'export_batch': 7})
+            self._register_selector({'tenant': 'B', 'export_batch': 7})
+            assert job.revoked()
+        finally:
+            revoked_selectors.clear()
+
+    def test_stamped_selector_does_not_leak_into_revoked_stamps(self):
+        """Registering a selector must not split it into revoked_stamps keys.
+
+        Splitting {'tenant': 'A', 'export_batch': 7} into independent
+        revoked_stamps keys would also revoke (A, 8) and (B, 7).
+        """
+        revoked_selectors.clear()
+        revoked_stamps.clear()
+        try:
+            self._register_selector({'tenant': 'A', 'export_batch': 7})
+            assert not revoked_stamps
+            assert len(revoked_selectors) == 1
+        finally:
+            revoked_selectors.clear()
 
     def test_execute_does_not_execute_revoked(self):
         job = self.xRequest()
