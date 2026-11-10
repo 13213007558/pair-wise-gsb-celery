@@ -195,6 +195,75 @@ with the private key and certificate files located in `/etc/ssl`.
     Also note that the `auth` serializer won't encrypt the contents of
     a message, so if needed this will have to be enabled separately.
 
+.. warning::
+
+    The legacy `auth` serializer signs only the serialized message
+    *body*.  With task protocol 2 the task name, task id and other
+    headers travel outside the body, and the envelope's content
+    type/encoding are not covered either, so anyone able to modify
+    messages in transit (e.g. a compromised broker) can change which
+    task is executed.  Prefer the `signed-task` serializer described
+    below, which binds the whole execution semantics of the message
+    into the signature.
+
+Signed Task Messages
+--------------------
+
+The `signed-task` serializer (version 1) is an explicitly opt-in message
+format that signs the complete execution semantics of a task message:
+
+* the task name and task id (and all other task headers),
+* the message properties (correlation id, reply-to),
+* the serialized argument body,
+* the content type and content encoding of that body, and
+* the ``callbacks``/``errbacks``/``chain``/``chord`` embed that controls
+  how execution continues after the task runs.
+
+The signed payload is a JSON envelope with an explicit ``format`` marker
+and ``version`` number; the signature covers the canonical JSON encoding
+(sorted keys, no insignificant whitespace, UTF-8) of the envelope, so the
+signed byte representation is unambiguous.  A worker never builds an
+executable request from the outer, broker-visible message fields: the
+headers and properties are only taken from the envelope *after* the
+signature has been verified, and a failed verification rejects the
+message without falling back to any unsigned or legacy interpretation.
+
+To enable it, configure:
+
+.. code-block:: python
+
+    app = Celery()
+    app.conf.update(
+        security_key='/etc/ssl/private/worker.key'
+        security_certificate='/etc/ssl/certs/worker.pem'
+        security_cert_store='/etc/ssl/certs/*.pem',
+        security_digest='sha256',
+        task_serializer='signed-task',
+        accept_content=['signed-task'],
+    )
+    app.setup_security()
+
+The format requires :setting:`task_protocol` 2 (the default).
+
+While migrating producers from the legacy `auth` serializer, workers may
+also accept legacy signed messages by explicitly enabling the
+compatibility switch :setting:`security_allow_legacy_auth` and adding
+`'auth'` to `accept_content`.  Keep in mind that legacy `auth` messages
+do not protect the task headers, so the switch should be turned off
+again once all producers send `signed-task` messages.
+
+.. note::
+
+    The signature protects message *integrity* and the *identity of the
+    signer*: a worker can trust that an accepted message was produced by
+    someone holding the private key and was not modified afterwards.
+    It does **not** protect against *replay*: an attacker who obtains a
+    validly signed message can re-publish it, and the signature will
+    still verify.  Detecting a re-delivered task id requires additional
+    state (for example a deduplication store, result backend
+    bookkeeping, or idempotent task design) and is not provided by the
+    signing layer.
+
 .. _`X.509`: https://en.wikipedia.org/wiki/X.509
 .. _`Certificate Authority`:
     https://en.wikipedia.org/wiki/Certificate_authority

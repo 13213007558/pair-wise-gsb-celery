@@ -4476,6 +4476,18 @@ A cryptography digest used to sign messages
 when :ref:`message-signing` is used.
 https://cryptography.io/en/latest/hazmat/primitives/cryptographic-hashes/#module-cryptography.hazmat.primitives.hashes
 
+.. setting:: security_allow_legacy_auth
+
+``security_allow_legacy_auth``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: :const:`False`.
+
+Compatibility switch allowing workers configured for the `signed-task`
+serializer to also accept legacy `auth` signed messages (which do not
+protect the task headers).  Only enable this while migrating producers
+to the `signed-task` format; see :ref:`message-signing`.
+
 .. _conf-custom-components:
 
 Custom Component Classes (advanced)

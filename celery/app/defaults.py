@@ -248,6 +248,7 @@ NAMESPACES = Namespace(
         key=Option(type='string'),
         key_password=Option(type='bytes'),
         digest=Option(DEFAULT_SECURITY_DIGEST, type='string'),
+        allow_legacy_auth=Option(False, type='bool'),
     ),
     database=Namespace(
         url=Option(old={'celery_result_dburi'}),

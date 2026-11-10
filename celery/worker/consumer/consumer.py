@@ -25,6 +25,7 @@ from celery import bootsteps, signals
 from celery.app.trace import build_tracer
 from celery.exceptions import (CPendingDeprecationWarning, InvalidTaskError, NotRegistered, WorkerShutdown,
                                WorkerTerminate)
+from celery.security.signed_task import SIGNED_TASK_CONTENT_TYPE
 from celery.utils.functional import noop
 from celery.utils.log import get_logger
 from celery.utils.nodenames import gethostname
@@ -804,22 +805,50 @@ class Consumer:
         call_soon_ack = self.call_soon_ack
 
         def on_task_received(message):
-            # payload will only be set for v1 protocol, since v2
-            # will defer deserializing the message body to the pool.
+            # payload will only be set for v1 protocol and signed-task
+            # messages, since v2 will defer deserializing the message
+            # body to the pool.
             payload = None
-            try:
-                type_ = message.headers['task']  # protocol v2
-            except TypeError:
-                return on_unknown_message(None, message)
-            except KeyError:
+            if message.content_type == SIGNED_TASK_CONTENT_TYPE:
+                # signed-task format: the task headers, properties and
+                # body all live inside the signed envelope.  Nothing from
+                # the outer, broker-visible message may be used to build
+                # an executable request before the signature verifies,
+                # and a failed verification never falls back to treating
+                # the message as unsigned.
                 try:
-                    payload = message.decode()
+                    signed_payload = message.decode()
                 except Exception as exc:  # pylint: disable=broad-except
                     return self.on_decode_error(message, exc)
                 try:
-                    type_, payload = payload['task'], payload  # protocol v1
-                except (TypeError, KeyError):
-                    return on_unknown_message(payload, message)
+                    verified_headers = signed_payload['headers']
+                    verified_properties = signed_payload['properties']
+                    verified_body = signed_payload['body']
+                    type_ = verified_headers['task']
+                    if not isinstance(verified_body, (list, tuple)) or \
+                            len(verified_body) != 3:
+                        raise TypeError('signed task body is not a 3-tuple')
+                except (AttributeError, TypeError, KeyError):
+                    return on_unknown_message(None, message)
+                # signature verified: the verified fields replace the
+                # untrusted outer ones for everything downstream.
+                message.headers = verified_headers
+                message.properties = verified_properties
+                payload = tuple(verified_body)
+            else:
+                try:
+                    type_ = message.headers['task']  # protocol v2
+                except TypeError:
+                    return on_unknown_message(None, message)
+                except KeyError:
+                    try:
+                        payload = message.decode()
+                    except Exception as exc:  # pylint: disable=broad-except
+                        return self.on_decode_error(message, exc)
+                    try:
+                        type_, payload = payload['task'], payload  # protocol v1
+                    except (TypeError, KeyError):
+                        return on_unknown_message(payload, message)
             try:
                 strategy = strategies[type_]
             except KeyError as exc:

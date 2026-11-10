@@ -12,6 +12,7 @@ from kombu.utils.functional import maybe_list, retry_over_time
 from kombu.utils.objects import cached_property
 
 from celery import signals
+from celery.security.signed_task import SIGNED_TASK_SERIALIZER
 from celery.utils.log import get_logger
 from celery.utils.nodenames import anon_nodename
 from celery.utils.saferepr import saferepr
@@ -607,6 +608,21 @@ class AMQP:
                 declare=declare, headers=headers2,
                 properties=properties, retry_policy=_rp,
             )
+            publish_body, publish_headers, publish_properties = (
+                body, headers2, properties)
+            if (serializer or default_serializer) == SIGNED_TASK_SERIALIZER:
+                # The signed-task format binds the execution semantics
+                # (task name, task id, args/kwargs body and the
+                # callbacks/errbacks/chain embed) into the signed payload,
+                # so headers and properties are moved inside the signed
+                # envelope.  The outer, broker-visible message carries no
+                # task fields a receiver could act on without verification.
+                publish_body = {
+                    'headers': headers2,
+                    'properties': properties,
+                    'body': body,
+                }
+                publish_headers, publish_properties = {}, {}
             publish_kwargs = dict(
                 exchange=exchange,
                 routing_key=routing_key,
@@ -614,9 +630,9 @@ class AMQP:
                 compression=compression or default_compressor,
                 retry=retry, retry_policy=_rp,
                 delivery_mode=delivery_mode, declare=declare,
-                headers=headers2,
+                headers=publish_headers,
                 timeout=timeout, confirm_timeout=confirm_timeout,
-                **properties
+                **publish_properties
             )
             if retry and _callback_publish_retry.get():
                 # The parent task already ran, so retry only this message,
@@ -643,7 +659,7 @@ class AMQP:
                     ret = retry_over_time(
                         producer.publish,
                         _publish_retry_errors(_rp, conn),
-                        args=(body,),
+                        args=(publish_body,),
                         kwargs=dict(publish_kwargs, retry=False),
                         errback=on_publish_retry,
                         max_retries=max_retries,
@@ -658,7 +674,7 @@ class AMQP:
                     )
                     raise
             else:
-                ret = producer.publish(body, **publish_kwargs)
+                ret = producer.publish(publish_body, **publish_kwargs)
             send_after_publish(
                 sender=name, body=body, headers=headers2,
                 exchange=exchange, routing_key=routing_key,

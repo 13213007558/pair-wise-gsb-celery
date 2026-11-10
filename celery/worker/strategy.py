@@ -131,7 +131,14 @@ def default(task, app, consumer,
 
     def task_message_handler(message, body, ack, reject, callbacks,
                              to_timestamp=to_timestamp):
-        if body is None and 'args' not in message.payload:
+        if isinstance(body, tuple):
+            # signed-task message: the consumer already verified the
+            # signature and decoded the body, and replaced the message
+            # headers with the verified ones.
+            body, headers, decoded, utc = (
+                body, message.headers, True, app.uses_utc_timezone(),
+            )
+        elif body is None and 'args' not in message.payload:
             body, headers, decoded, utc = (
                 message.body, message.headers, False, app.uses_utc_timezone(),
             )

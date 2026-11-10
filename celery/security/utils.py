@@ -19,7 +19,12 @@ def get_digest_algorithm(digest='sha256'):
 @contextmanager
 def reraise_errors(msg='{0!r}', errors=None):
     """Context reraising crypto errors as :exc:`SecurityError`."""
-    errors = (cryptography.exceptions,) if errors is None else errors
+    if errors is None:
+        errors = (
+            cryptography.exceptions.InvalidSignature,
+            cryptography.exceptions.InvalidKey,
+            cryptography.exceptions.UnsupportedAlgorithm,
+        )
     try:
         yield
     except errors as exc:
