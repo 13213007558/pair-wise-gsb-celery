@@ -556,6 +556,29 @@ class Signature(dict):
     def _merge(self, args=None, kwargs=None, options=None, force=False):
         """Merge partial args/kwargs/options with existing ones.
 
+        Each section follows its own precedence rule, implemented by a
+        dedicated entry point (:meth:`_merge_args`, :meth:`_merge_kwargs`,
+        :meth:`_merge_options`).  From highest to lowest priority:
+
+        ============  =====================================================
+        Section       Rule
+        ============  =====================================================
+        stamps        Registered stamps (keys listed in
+                      ``options['stamped_headers']``) already set on the
+                      signature always win; an incoming value is only
+                      accepted when the stamp is not set yet.
+        imm. options  Options in :attr:`_IMMUTABLE_OPTIONS` (``group_id``,
+                      ``stamped_headers``) already set on the signature
+                      win; an incoming value is only accepted when unset.
+        options       Plain options: the incoming value overrides the
+                      existing one.
+        kwargs        Incoming kwargs override existing ones, unless the
+                      signature is immutable and the merge is not forced.
+        args          Incoming args are *prepended* to the existing ones,
+                      unless the signature is immutable and the merge is
+                      not forced.
+        ============  =====================================================
+
         If the signature is immutable and ``force`` is False, the existing
         args/kwargs will be returned as-is and only the options will be merged.
 
@@ -574,26 +597,53 @@ class Signature(dict):
         """
         args = args if args else ()
         kwargs = kwargs if kwargs else {}
-        if options is not None:
-            # We build a new options dictionary where values in `options`
-            # override values in `self.options` except for keys which are
-            # noted as being immutable (unrelated to signature immutability)
-            # implying that allowing their value to change would stall tasks
-            immutable_options = self._IMMUTABLE_OPTIONS
-            if "stamped_headers" in self.options:
-                immutable_options = self._IMMUTABLE_OPTIONS.union(set(self.options.get("stamped_headers", [])))
-            # merge self.options with options without overriding stamped headers from self.options
-            new_options = {**self.options, **{
-                k: v for k, v in options.items()
-                if k not in immutable_options or k not in self.options
-            }}
-        else:
-            new_options = self.options
+        new_options = self._merge_options(options)
         if self.immutable and not force:
             return (self.args, self.kwargs, new_options)
-        return (tuple(args) + tuple(self.args) if args else self.args,
-                dict(self.kwargs, **kwargs) if kwargs else self.kwargs,
+        return (self._merge_args(args),
+                self._merge_kwargs(kwargs),
                 new_options)
+
+    def _merge_args(self, args):
+        """Merge partial args by prepending them to the existing args."""
+        return tuple(args) + tuple(self.args) if args else self.args
+
+    def _merge_kwargs(self, kwargs):
+        """Merge partial kwargs, letting incoming values override existing ones."""
+        return dict(self.kwargs, **kwargs) if kwargs else self.kwargs
+
+    def _protected_option_keys(self):
+        """Return the option keys a merge must never override once set.
+
+        This combines the class-level immutable options (unrelated to
+        signature immutability -- changing them would stall tasks) with
+        the stamps registered in ``options['stamped_headers']``.
+        """
+        protected = set(self._IMMUTABLE_OPTIONS)
+        protected.update(self.options.get('stamped_headers') or ())
+        return protected
+
+    def _merge_options(self, options):
+        """Merge partial options with the existing options.
+
+        Plain options are overridden by the incoming values.  Protected
+        options (immutable options and registered stamps, see
+        :meth:`_protected_option_keys`) keep the value already stored on
+        the signature and only accept an incoming value when unset.
+        """
+        if options is None:
+            return self.options
+        protected = self._protected_option_keys()
+        # Build a new options dictionary instead of updating in place so
+        # the signature is never mutated by a merge.
+        new_options = dict(self.options)
+        for key, value in options.items():
+            if key in protected and key in self.options:
+                # Immutable option or registered stamp already set: the
+                # value confirmed at the entry point wins.
+                continue
+            new_options[key] = value
+        return new_options
 
     def clone(self, args=None, kwargs=None, **opts):
         """Create a copy of this signature.
@@ -746,14 +796,20 @@ class Signature(dict):
         #   _merge_dictionaries(headers, visitor_headers, aggregate_duplicates=False)
         #   headers["foo"] == "bar2" -> "bar1" is lost, but the stamp is according to the visitor
 
-        headers = headers.copy()
+        # Take ownership of every value merged here: the dict built by
+        # this method is fanned out to every child of a group/chain/chord,
+        # and _merge_dictionaries() mutates list values in place.  Working
+        # on deep copies keeps one sibling's stamps from leaking into the
+        # others and leaves the caller's (and the visitor's) objects
+        # untouched.
+        headers = deepcopy(headers)
 
         if "stamped_headers" not in headers:
             headers["stamped_headers"] = list(headers.keys())
 
         # Merge headers with visitor headers
         if visitor_headers is not None:
-            visitor_headers = visitor_headers or {}
+            visitor_headers = deepcopy(visitor_headers) or {}
             if "stamped_headers" not in visitor_headers:
                 visitor_headers["stamped_headers"] = list(visitor_headers.keys())
 
@@ -767,7 +823,10 @@ class Signature(dict):
             stamped_headers.update(self.options.get("stamped_headers", []))
             headers["stamped_headers"] = list(stamped_headers)
             # Only merge stamps that are in stamped_headers from self.options
-            redacted_options = {k: v for k, v in self.options.items() if k in headers["stamped_headers"]}
+            redacted_options = {
+                k: deepcopy(v) for k, v in self.options.items()
+                if k in headers["stamped_headers"]
+            }
 
             # Sync from self.options
             _merge_dictionaries(headers, redacted_options, aggregate_duplicates=append_stamps)

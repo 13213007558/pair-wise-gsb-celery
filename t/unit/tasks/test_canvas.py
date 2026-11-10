@@ -354,6 +354,58 @@ class test_Signature(CanvasCase):
         _, _, new_options = sig._merge(options={"group_id": sentinel.new_gid})
         assert new_options == {"group_id": sentinel.old_gid}
 
+    def test_merge_options__plain_options_overridden(self):
+        sig = self.add.s(1, 2)
+        sig.set(priority=1, countdown=5)
+        _, _, new_options = sig._merge(options={"priority": 9})
+        assert new_options == {"priority": 9, "countdown": 5}
+
+    def test_merge_options__stamped_headers_not_overridden(self):
+        # Registered stamps are protected like immutable options: a merge
+        # must not replace a stamp already set on the signature.
+        sig = self.add.s(1, 2)
+        sig.stamp(tenant=["acme"])
+        _, _, new_options = sig._merge(options={"tenant": ["other"]})
+        assert new_options["tenant"] == ["acme"]
+        # ...but a stamp that is registered and not set yet can be merged in
+        sig = self.add.s(1, 2)
+        sig.options["stamped_headers"] = ["tenant"]
+        _, _, new_options = sig._merge(options={"tenant": ["acme"]})
+        assert new_options["tenant"] == ["acme"]
+
+    def test_merge_options__force_does_not_override_stamps(self):
+        sig = self.add.si(1, 2)
+        sig.stamp(tenant="acme")
+        args, kwargs, options = sig._merge((4,), {"x": 1}, {"tenant": "other"}, force=True)
+        assert args == (4, 1, 2)
+        assert kwargs == {"x": 1}
+        assert options["tenant"] == "acme"
+
+    def test_merge_options__does_not_mutate_signature(self):
+        sig = self.add.s(1, 2)
+        sig.set(priority=1)
+        before = dict(sig.options)
+        sig._merge(options={"priority": 9, "group_id": sentinel.gid})
+        assert sig.options == before
+
+    def test_merge_entry_points(self):
+        sig = self.add.s(1, 2, foo=1)
+        # args: partial args are prepended
+        assert sig._merge_args((0,)) == (0, 1, 2)
+        assert sig._merge_args(()) is sig.args
+        # kwargs: incoming values override existing ones
+        assert sig._merge_kwargs({"foo": 2, "bar": 3}) == {"foo": 2, "bar": 3}
+        assert sig._merge_kwargs({}) is sig.kwargs
+        # options: None means "no merge", the options are returned as-is
+        assert sig._merge_options(None) is sig.options
+
+    def test_protected_option_keys(self):
+        sig = self.add.s(1, 2)
+        assert sig._protected_option_keys() == Signature._IMMUTABLE_OPTIONS
+        sig.stamp(tenant="acme")
+        protected = sig._protected_option_keys()
+        assert protected >= {"group_id", "stamped_headers", "tenant"}
+
     def test_set_immutable(self):
         x = self.add.s(2, 2)
         assert not x.immutable

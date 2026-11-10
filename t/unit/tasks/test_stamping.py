@@ -1343,3 +1343,89 @@ class test_stamping_mechanism(CanvasCase):
                 nested_stamp={"shared": 1, "only_sig": 1},
             )
             assert sig.options["nested_stamp"] == {"shared": [1, 2], "only_sig": 1}
+
+
+class test_list_valued_stamp_isolation(CanvasCase):
+    """List-valued stamps must not be shared or mutated across a canvas.
+
+    Regression tests: _stamp_headers() merged stamps into a shallow copy of
+    the incoming headers, so one list object was fanned out to every child
+    of a group/chain/chord and mutated in place by _merge_dictionaries().
+    Siblings collected each other's stamps, and the caller's own list
+    objects were modified as a side effect of stamping.
+    """
+
+    def test_clone_and_partial_do_not_share_list_stamps(self):
+        original = self.add.s(1, 1)
+        original.stamp(tenant=["acme"])
+
+        for cloned in (original.clone(), original.partial()):
+            assert cloned.options["tenant"] == ["acme"]
+            assert cloned.options["tenant"] is not original.options["tenant"]
+            assert cloned.options["stamped_headers"] is not original.options["stamped_headers"]
+            cloned.options["tenant"].append("mutated-on-clone")
+            assert original.options["tenant"] == ["acme"]
+
+    def test_link_stamp_does_not_share_list_with_parent(self):
+        sig = self.add.s(1, 1)
+        callback = self.add.s(0, 0)
+        sig.link(callback)
+        sig.stamp(tenant=["acme"])
+
+        assert callback.options["tenant"] == ["acme"]
+        assert callback.options["tenant"] is not sig.options["tenant"]
+        callback.options["tenant"].append("mutated-on-callback")
+        assert sig.options["tenant"] == ["acme"]
+
+    def test_chain_stamping_keeps_sibling_list_stamps_separate(self):
+        sig_1 = self.add.s(1, 1)
+        sig_2 = self.add.s(2, 2)
+        sig_1.stamp(tenant=["a"])
+        sig_2.stamp(tenant=["b"])
+
+        chain(sig_1, sig_2, app=self.app).stamp(tenant=["stamped"])
+
+        assert sig_1.options["tenant"] == ["stamped", "a"]
+        assert sig_2.options["tenant"] == ["stamped", "b"]
+        assert sig_1.options["tenant"] is not sig_2.options["tenant"]
+
+    def test_group_stamping_keeps_sibling_list_stamps_separate(self):
+        sig_1 = self.add.s(1, 1)
+        sig_2 = self.add.s(2, 2)
+        sig_1.stamp(tenant=["a"])
+        sig_2.stamp(tenant=["b"])
+
+        group(sig_1, sig_2, app=self.app).stamp(tenant=["stamped"])
+
+        assert sig_1.options["tenant"] == ["stamped", "a"]
+        assert sig_2.options["tenant"] == ["stamped", "b"]
+        assert sig_1.options["tenant"] is not sig_2.options["tenant"]
+
+    def test_group_stamping_does_not_mutate_caller_list(self):
+        sig_1 = self.add.s(1, 1)
+        sig_2 = self.add.s(2, 2)
+        sig_1.stamp(tenant=["a"])
+        tenant = ["stamped"]
+
+        group(sig_1, sig_2, app=self.app).stamp(tenant=tenant)
+
+        assert tenant == ["stamped"]
+
+    def test_chord_stamping_keeps_header_list_stamps_separate(self):
+        sig_1 = self.add.s(1, 1)
+        sig_2 = self.add.s(2, 2)
+        sig_1.stamp(tenant=["a"])
+        sig_2.stamp(tenant=["b"])
+
+        c = chord([sig_1, sig_2], self.xsum.s(), app=self.app)
+        c.stamp(tenant=["stamped"])
+
+        header = c.tasks
+        tasks = header.tasks if isinstance(header, group) else header
+        assert tasks[0].options["tenant"] == ["stamped", "a"]
+        assert tasks[1].options["tenant"] == ["stamped", "b"]
+        assert tasks[0].options["tenant"] is not tasks[1].options["tenant"]
+        # the chord clones the signatures it is given, so stamping the
+        # chord must not change the originals
+        assert sig_1.options["tenant"] == ["a"]
+        assert sig_2.options["tenant"] == ["b"]
