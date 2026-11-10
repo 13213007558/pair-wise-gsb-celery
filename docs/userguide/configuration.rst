@@ -161,6 +161,7 @@ For a complete Django example, see :ref:`django-first-steps`.
 ``CELERY_RESULT_EXPIRES``                  :setting:`result_expires`
 ``CELERY_RESULT_PERSISTENT``               :setting:`result_persistent`
 ``CELERY_RESULT_SERIALIZER``               :setting:`result_serializer`
+``CELERY_RESULT_REMOTE_EXCEPTION_ALLOWLIST`` :setting:`result_remote_exception_allowlist`
 ``CELERY_RESULT_DBURI``                    Use :setting:`result_backend` instead.
 ``CELERY_RESULT_ENGINE_OPTIONS``           :setting:`database_engine_options`
 ``[...]_DB_SHORT_LIVED_SESSIONS``          :setting:`database_short_lived_sessions`
@@ -921,6 +922,53 @@ Default: :const:`False`
 If enabled, the backend will try to retry on the event of recoverable
 exceptions instead of propagating the exception.
 It will use an exponential backoff sleep time between retries.
+
+
+.. setting:: result_remote_exception_allowlist
+
+``result_remote_exception_allowlist``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: :const:`None`
+
+A tuple of exception classes that may be reconstructed when a failed task
+result is decoded from a non-pickle serializer (for example the default
+:setting:`result_serializer` ``json``).
+
+The result backend must not be treated as a trusted data source: a stored
+failure only records the exception's module, qualified name and arguments
+as strings. When this setting is :const:`None` (the default), Celery keeps
+its historical, permissive behavior and resolves the remote type name
+against modules already imported in the client process.
+
+Setting it to any tuple, including an empty one, opts in to controlled
+exception reconstruction:
+
+- Only the exact class objects listed here are ever instantiated. Matching
+  is by the registered class's own ``(__module__, __qualname__)`` pair, so
+  a remote payload cannot import a module, walk an arbitrary attribute
+  chain, or resolve to a different class that merely has the same string
+  name.
+- A remote exception whose type is not on the allowlist is returned as a
+  :class:`~celery.exceptions.RemoteException`. The original type name and
+  the remote message are preserved for diagnostics, but the remote type's
+  constructor is never invoked.
+- If an allowlisted constructor itself raises, the failure is contained
+  and a plain :exc:`Exception` describing it is returned.
+
+Entries that are not exception classes raise
+:exc:`~celery.exceptions.ImproperlyConfigured` when the backend is created.
+
+Example:
+
+.. code-block:: python
+
+    result_remote_exception_allowlist = (ValueError, KeyError)
+
+The :meth:`~celery.result.AsyncResult.get` ``propagate`` option is
+unchanged in both modes: with ``propagate=True`` the reconstructed
+exception or the :class:`~celery.exceptions.RemoteException` is re-raised,
+and with ``propagate=False`` the exception instance is returned instead.
 
 
 .. setting:: result_backend_max_sleep_between_retries_ms

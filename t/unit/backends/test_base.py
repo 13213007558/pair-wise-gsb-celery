@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import re
+import sys
 from contextlib import contextmanager
 from unittest.mock import ANY, MagicMock, Mock, call, patch, sentinel
 from uuid import UUID
@@ -16,7 +17,7 @@ from celery.backends.base import (COMPRESSED_PAYLOAD_MAGIC, BaseBackend, Disable
                                   _create_chord_error_with_cause, _create_fake_task_request, _nulldict,
                                   compress_payload, decompress_payload)
 from celery.exceptions import (BackendGetMetaError, BackendStoreError, ChordError, ImproperlyConfigured,
-                               SecurityError, TimeoutError)
+                               RemoteException, SecurityError, TimeoutError)
 from celery.result import GroupResult, result_from_tuple
 from celery.utils import serialization
 from celery.utils.functional import pass1
@@ -2559,3 +2560,251 @@ class test_failure_expires_support:
     def test_no_warning_when_unset(self, recwarn):
         KVBackend(app=self.app)
         assert not [w for w in recwarn if 'result_failure_expires' in str(w.message)]
+
+
+class TracingError(Exception):
+    """Exception whose constructor appends a marker to an in-memory list."""
+
+    markers = []
+
+    def __init__(self, *args):
+        type(self).markers.append(('TracingError', args))
+        super().__init__(*args)
+
+
+class UnregisteredTracingError(Exception):
+    """Tracing exception that is never placed on any allowlist."""
+
+    markers = []
+
+    def __init__(self, *args):
+        type(self).markers.append(('UnregisteredTracingError', args))
+        super().__init__(*args)
+
+
+class NestedContainer:
+    class NestedTracingError(Exception):
+        markers = []
+
+        def __init__(self, *args):
+            type(self).markers.append(('NestedTracingError', args))
+            super().__init__(*args)
+
+
+class FailingConstructorError(Exception):
+
+    def __init__(self, *args):
+        raise RuntimeError('constructor always fails')
+
+
+class test_remote_exception_allowlist:
+
+    def setup_method(self):
+        TracingError.markers.clear()
+        UnregisteredTracingError.markers.clear()
+        NestedContainer.NestedTracingError.markers.clear()
+        self.app.conf.result_remote_exception_allowlist = None
+
+    def _backend(self, allowlist=..., serializer='json'):
+        if allowlist is not ...:
+            self.app.conf.result_remote_exception_allowlist = allowlist
+        return KVBackend(app=self.app, serializer=serializer)
+
+    def test_default_is_legacy_permissive_mode(self):
+        backend = self._backend()
+        assert backend.remote_exception_allowlist is None
+        # Legacy behavior still resolves an already-imported module class.
+        exc = backend.exception_to_python({
+            'exc_type': 'ValueError',
+            'exc_module': 'builtins',
+            'exc_message': ('legacy',),
+        })
+        assert isinstance(exc, ValueError)
+        assert exc.args == ('legacy',)
+
+    def test_empty_allowlist_reconstructs_nothing(self):
+        backend = self._backend(allowlist=())
+        assert backend.remote_exception_allowlist == {}
+        exc = backend.exception_to_python({
+            'exc_type': 'ValueError',
+            'exc_module': 'builtins',
+            'exc_message': ('x',),
+        })
+        assert isinstance(exc, RemoteException)
+        assert exc.remote_name == 'builtins.ValueError'
+
+    def test_unregistered_remote_type_never_invokes_its_constructor(self):
+        backend = self._backend(allowlist=(TracingError,))
+        payload = {
+            'exc_type': 'UnregisteredTracingError',
+            'exc_module': UnregisteredTracingError.__module__,
+            'exc_message': ('do not run me',),
+        }
+        exc = backend.exception_to_python(payload)
+        assert isinstance(exc, RemoteException)
+        assert UnregisteredTracingError.markers == []
+        assert exc.exc_type == 'UnregisteredTracingError'
+        assert exc.exc_module == UnregisteredTracingError.__module__
+        assert exc.exc_message == ('do not run me',)
+        assert UnregisteredTracingError.__module__ in str(exc)
+        assert 'do not run me' in str(exc)
+
+    def test_registered_remote_type_is_reconstructed(self):
+        backend = self._backend(allowlist=(TracingError,))
+        payload = {
+            'exc_type': 'TracingError',
+            'exc_module': TracingError.__module__,
+            'exc_message': ('allowed',),
+        }
+        exc = backend.exception_to_python(payload)
+        assert isinstance(exc, TracingError)
+        assert exc.args == ('allowed',)
+        assert TracingError.markers == [('TracingError', ('allowed',))]
+
+    def test_string_name_lookalike_is_not_treated_as_registered(self):
+        # A different class object carrying the same qualified name lives in
+        # another module. The allowlist key is an exact (module, qualname)
+        # match, so it must not resolve to the registered object.
+        import types
+        lookalike_module = types.ModuleType('lookalike_pkg')
+        lookalike_module.TracingError = type(
+            'TracingError', (Exception,), {
+                '__module__': 'lookalike_pkg',
+                '__init__': lambda self, *a: UnregisteredTracingError.markers.append(
+                    ('lookalike', a)),
+            })
+        sys.modules['lookalike_pkg'] = lookalike_module
+        try:
+            backend = self._backend(allowlist=(TracingError,))
+            exc = backend.exception_to_python({
+                'exc_type': 'TracingError',
+                'exc_module': 'lookalike_pkg',
+                'exc_message': ('x',),
+            })
+            assert isinstance(exc, RemoteException)
+            assert exc.remote_name == 'lookalike_pkg.TracingError'
+            assert UnregisteredTracingError.markers == []
+        finally:
+            del sys.modules['lookalike_pkg']
+
+    def test_remote_module_is_never_imported(self):
+        backend = self._backend(allowlist=(TracingError,))
+        assert 'definitely_not_a_real_celery_module' not in sys.modules
+        exc = backend.exception_to_python({
+            'exc_type': 'Anything',
+            'exc_module': 'definitely_not_a_real_celery_module',
+            'exc_message': ('boom',),
+        })
+        assert isinstance(exc, RemoteException)
+        assert 'definitely_not_a_real_celery_module' not in sys.modules
+
+    def test_nested_qualified_name_requires_exact_registered_object(self):
+        nested = NestedContainer.NestedTracingError
+        backend = self._backend(allowlist=(nested,))
+        payload = {
+            'exc_type': 'NestedContainer.NestedTracingError',
+            'exc_module': nested.__module__,
+            'exc_message': ('deep',),
+        }
+        exc = backend.exception_to_python(payload)
+        assert isinstance(exc, nested)
+        assert nested.markers == [('NestedTracingError', ('deep',))]
+
+        # A nested name that was not registered is not walked via getattr.
+        other = backend.exception_to_python({
+            'exc_type': 'NestedContainer.OtherError',
+            'exc_module': nested.__module__,
+            'exc_message': (),
+        })
+        assert isinstance(other, RemoteException)
+        assert other.remote_name == (
+            f'{nested.__module__}.NestedContainer.OtherError')
+
+    def test_constructor_failure_is_contained(self):
+        backend = self._backend(allowlist=(FailingConstructorError,))
+        exc = backend.exception_to_python({
+            'exc_type': 'FailingConstructorError',
+            'exc_module': FailingConstructorError.__module__,
+            'exc_message': ['arg'],
+        })
+        assert isinstance(exc, Exception)
+        assert not isinstance(exc, FailingConstructorError)
+        assert 'FailingConstructorError' in str(exc)
+
+    def test_missing_exc_type_still_raises_value_error(self):
+        backend = self._backend(allowlist=())
+        with pytest.raises(ValueError,
+                           match='must include the exception type'):
+            backend.exception_to_python(
+                {'exc_module': 'builtins', 'exc_message': ()})
+
+    def test_missing_message_defaults_to_empty_string(self):
+        backend = self._backend(allowlist=())
+        exc = backend.exception_to_python(
+            {'exc_type': 'Whatever', 'exc_module': 'm'})
+        assert isinstance(exc, RemoteException)
+        assert exc.exc_message == ''
+        assert exc.remote_name == 'm.Whatever'
+
+    def test_invalid_allowlist_entry_raises_improperly_configured(self):
+        with pytest.raises(ImproperlyConfigured,
+                           match='must be exception classes'):
+            self._backend(allowlist=('not a class',))
+        with pytest.raises(ImproperlyConfigured,
+                           match='must be exception classes'):
+            self._backend(allowlist=(object,))
+
+    def test_full_decode_path_does_not_call_unregistered_constructor(self):
+        backend = self._backend(allowlist=(TracingError,))
+        task_id = uuid()
+        backend.store_result(
+            task_id,
+            TracingError('encoded on the worker'),
+            states.FAILURE,
+        )
+        # Tamper with the stored payload to claim an unregistered remote
+        # type, simulating a backend that is not a trusted data source.
+        stored = backend.get(backend.get_key_for_task(task_id))
+        meta = backend.decode(stored)
+        meta['result'] = {
+            'exc_type': 'UnregisteredTracingError',
+            'exc_module': UnregisteredTracingError.__module__,
+            'exc_message': ('payload',),
+        }
+        backend._set_with_state(
+            backend.get_key_for_task(task_id),
+            backend.encode(meta),
+            states.FAILURE,
+        )
+
+        decoded = backend.decode_result(
+            backend.get(backend.get_key_for_task(task_id)))
+        assert isinstance(decoded['result'], RemoteException)
+        assert UnregisteredTracingError.markers == []
+
+        result = self.app.AsyncResult(task_id, backend=backend)
+        with pytest.raises(RemoteException):
+            result.get(propagate=True)
+        # propagate=False keeps the failure value instead of raising it.
+        assert isinstance(result.get(propagate=False), RemoteException)
+        assert UnregisteredTracingError.markers == []
+
+    def test_full_decode_path_reconstructs_registered_failure(self):
+        backend = self._backend(allowlist=(TracingError,))
+        task_id = uuid()
+        backend.store_result(
+            task_id, TracingError('real failure'), states.FAILURE)
+
+        result = self.app.AsyncResult(task_id, backend=backend)
+        with pytest.raises(TracingError, match='real failure'):
+            result.get(propagate=True)
+        assert isinstance(result.get(propagate=False), TracingError)
+
+    def test_successful_result_passes_through_unchanged(self):
+        backend = self._backend(allowlist=(TracingError,))
+        task_id = uuid()
+        backend.mark_as_done(task_id, {'answer': 42})
+        result = self.app.AsyncResult(task_id, backend=backend)
+        assert result.get(propagate=True) == {'answer': 42}
+        assert result.state == states.SUCCESS
+        assert TracingError.markers == []

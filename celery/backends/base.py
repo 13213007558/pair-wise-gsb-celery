@@ -27,7 +27,7 @@ from celery import chord, current_app, group, maybe_signature, states
 from celery._state import get_current_task
 from celery.app.task import Context
 from celery.exceptions import (BackendGetMetaError, BackendStoreError, ChordError, ImproperlyConfigured,
-                               NotRegistered, SecurityError, TaskRevokedError, TimeoutError)
+                               NotRegistered, RemoteException, SecurityError, TaskRevokedError, TimeoutError)
 from celery.result import GroupResult, ResultBase, ResultSet, allow_join_result, result_from_tuple
 from celery.utils.collections import BufferMap
 from celery.utils.functional import LRUCache, arity_greater, maybe_list
@@ -245,6 +245,11 @@ class Backend:
         (self.content_type,
          self.content_encoding,
          self.encoder) = serializer_registry._encoders[self.serializer]
+        # ``None`` keeps the historical, permissive reconstruction behavior.
+        # Any tuple (including an empty one) opts in to controlled
+        # reconstruction where only registered exception classes are rebuilt.
+        self.remote_exception_allowlist = self._prepare_remote_exception_allowlist(
+            conf.get('result_remote_exception_allowlist'))
         self.compression = self.prepare_compression(
             conf.get('result_compression'))
         cmax = max_cached_results or conf.result_cache_max
@@ -613,6 +618,53 @@ class Backend:
                 'exc_message': ensure_serializable(exc.args, self.encode),
                 'exc_module': exctype.__module__}
 
+    def _prepare_remote_exception_allowlist(self, allowlist):
+        """Validate the configured allowlist and index it by remote name.
+
+        Returns :const:`None` when controlled reconstruction is not opted
+        into, otherwise a mapping of ``(module, qualified name)`` to the
+        exact class object the caller registered. Only exception classes
+        are accepted, and only those exact objects are ever instantiated:
+        a remote string is never imported or resolved through an attribute
+        chain.
+        """
+        if allowlist is None:
+            return None
+        registry = {}
+        for cls in allowlist:
+            if not (isinstance(cls, type) and issubclass(cls, BaseException)):
+                raise ImproperlyConfigured(
+                    f'result_remote_exception_allowlist entries must be '
+                    f'exception classes, got: {cls!r}')
+            key = (cls.__module__, getattr(cls, '__qualname__', cls.__name__))
+            registry[key] = cls
+        return registry
+
+    def _find_allowed_remote_exception(self, exc_module, exc_type):
+        """Return the registered class for a remote exception name.
+
+        Lookup only consults the allowlist registry by exact
+        ``(module, qualified name)`` match. Modules are never imported and
+        no attribute chain is walked, so an unregistered name can never
+        resolve to a different object that merely shares a string name.
+        """
+        return self.remote_exception_allowlist.get((exc_module, exc_type))
+
+    @staticmethod
+    def _build_remote_exception(cls, exc_msg):
+        """Instantiate an allowlisted exception class from remote args.
+
+        Any failure inside the remote class's constructor is contained and
+        surfaced as a plain :exc:`Exception` carrying diagnostics, matching
+        the historical fallback.
+        """
+        try:
+            if isinstance(exc_msg, (tuple, list)):
+                return cls(*exc_msg)
+            return cls(exc_msg)
+        except Exception:  # noqa
+            return Exception(f'{cls}({exc_msg})')
+
     def exception_to_python(self, exc):
         """Convert serialized exception to Python exception."""
         if not exc:
@@ -636,6 +688,19 @@ class Backend:
         except KeyError as e:
             raise ValueError("Exception information must include "
                              "the exception type") from e
+        exc_msg = exc.get('exc_message', '')
+
+        if self.remote_exception_allowlist is not None:
+            # Controlled mode: only exact, pre-registered class objects can
+            # be reconstructed. The remote type name is treated purely as a
+            # dictionary key; nothing is imported and no attribute lookup on
+            # a module is performed.
+            cls = self._find_allowed_remote_exception(exc_module, exc_type)
+            if cls is None:
+                return RemoteException(
+                    exc_type, exc_module=exc_module, exc_message=exc_msg)
+            return self._build_remote_exception(cls, exc_msg)
+
         if exc_module is None:
             cls = create_exception_cls(
                 exc_type, __name__)
@@ -649,7 +714,6 @@ class Backend:
             except (KeyError, AttributeError):
                 cls = create_exception_cls(exc_type,
                                            celery.exceptions.__name__)
-        exc_msg = exc.get('exc_message', '')
 
         # If the recreated exception type isn't indeed an exception,
         # this is a security issue. Without the condition below, an attacker

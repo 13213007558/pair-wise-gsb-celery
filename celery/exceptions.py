@@ -24,6 +24,7 @@ Error Hierarchy
         - :exc:`~celery.exceptions.BackendError`
             - :exc:`~celery.exceptions.BackendGetMetaError`
             - :exc:`~celery.exceptions.BackendStoreError`
+            - :exc:`~celery.exceptions.RemoteException`
     - :class:`kombu.exceptions.KombuError`
         - :exc:`~celery.exceptions.OperationalError`
 
@@ -84,6 +85,7 @@ __all__ = (
 
     # Backend related errors.
     'BackendError', 'BackendGetMetaError', 'BackendStoreError',
+    'RemoteException',
 
     # Billiard task errors.
     'SoftTimeLimitExceeded', 'TimeLimitExceeded',
@@ -308,6 +310,37 @@ class BackendStoreError(BackendError):
 
     def __repr__(self):
         return super().__repr__() + " state:" + self.state + " task_id:" + self.task_id
+
+
+class RemoteException(BackendError):
+    """Stand-in for a remote exception type that may not be reconstructed.
+
+    When controlled exception reconstruction is enabled (see the
+    :setting:`result_remote_exception_allowlist` setting), an exception
+    reported by the result backend whose type is not on the allowlist is
+    replaced by this class. The original type's module and qualified name
+    and the remote arguments are kept for diagnostics, but the remote
+    type's constructor is never imported or invoked, so a compromised
+    result backend cannot trigger code on the client.
+    """
+
+    def __init__(self, exc_type, exc_module=None, exc_message=''):
+        self.exc_type = exc_type
+        self.exc_module = exc_module
+        self.exc_message = exc_message
+        full_name = exc_type if exc_module is None else f'{exc_module}.{exc_type}'
+        super().__init__(
+            f'Remote exception {full_name} is not on the '
+            f'result_remote_exception_allowlist and was not reconstructed: '
+            f'{exc_message!r}'
+        )
+
+    @property
+    def remote_name(self):
+        """Fully qualified name of the original remote exception type."""
+        if self.exc_module is None:
+            return self.exc_type
+        return f'{self.exc_module}.{self.exc_type}'
 
 
 class CeleryCommandException(ClickException):
