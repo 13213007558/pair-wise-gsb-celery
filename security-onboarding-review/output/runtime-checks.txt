@@ -1,0 +1,34 @@
+Runtime verification with real Celery objects; memory transport and test certificates only.
+
+--- Layer 1 - setup_security: serializer registration and fail-fast ---
+  [PASS] L1 auth serializer registered: registry._encoders contains 'auth' after setup_security()
+  [PASS] L1 default serializer is auth: registry default content type = 'application/data' (the auth envelope type)
+  [PASS] L1 rejects unsigned-task posture: ImproperlyConfigured: You have to configure a special task serializer
+  [PASS] L1 rejects missing key material: ImproperlyConfigured: Sorry, but you have to configure the
+
+--- Layer 2 - task consumption: FSCertStore verification per message ---
+  [PASS] L2 signed task round-trips: decoded body = {'task': 'review.echo', 'args': [1, 2]}
+  [PASS] L2 wire content type is the auth envelope: message.content_type = 'application/data' (inner JSON is signed, not parsed, before verification)
+  [PASS] L2 rogue signer rejected: root cause -> SecurityError: Unable to deserialize: SecurityError("Unknown certificate: b'XX Celery Onboarding Review Test CA (DO NOT TRUST) 9810342060595983845'")
+  [PASS] L2 empty store fails closed: consumption error root cause -> DecodeError: Unable to deserialize: SecurityError("Unknown certificate: b'XX Celery Onboarding Review Test CA (DO NOT TRUST) 9810342060595983844'")
+  [PASS] L2 wrong store fails closed: consumption error root cause -> DecodeError: Unable to deserialize: SecurityError("Unknown certificate: b'XX Celery Onboarding Review Test CA (DO NOT TRUST) 9810342060595983844'")
+
+--- Layer 3 - result backend: accept gate built at initialization ---
+  [PASS] L3 backend accept list is JSON-only: Backend.accept = ['application/json'] (from result_accept_content, enforced in kombu loads())
+  [PASS] L3 backend writes JSON: Backend.content_type = 'application/json'
+  [PASS] L3 legitimate JSON result decodes: meta = SUCCESS {'ok': True}
+  [PASS] L3 injected record is a pickle blob: first bytes = b'\x80\x04'
+  [PASS] L3 JSON gate blocks pickle record: ContentDisallowed: Refusing to deserialize untrusted content of type pickle (application/x-python-serialize)
+  [PASS] L3 counterexample has no result accept gate: result_accept_content = None
+  [PASS] L3 open backend executes injected pickle (documents the C2 hole): decoded result = 'untrusted object constructed', canary triggered = True
+
+--- Layer 4 - event dispatch: observability messages, unsigned ---
+  [PASS] L4 forged completion event is accepted: received 2 events, including = [{'type': 'task-succeeded', 'hostname': 'worker@forged', 'uuid': 'task-that-never-ran', 'result': 999, 'clock': 1}]
+  [PASS] L4 events carry no signature header: headers seen = [{'hostname': 'gen18736@swappleMBP.lan'}, {}]
+  [C3] conclusion: task-succeeded events cannot prove completion; use AsyncResult/the result backend for completion decisions
+
+=== runtime summary ===
+  all baseline expectations held; both counterexamples exhibited their documented failure.
+  Scope: this proves behavior of the reviewed configuration in an isolated in-memory environment.
+  It is NOT evidence that the production deployment is secure: broker ACLs, result-store access,
+  certificate lifecycle, and application event-handling code still need separate operational review.

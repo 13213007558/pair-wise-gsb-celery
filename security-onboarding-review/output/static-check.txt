@@ -1,0 +1,56 @@
+Static, offline review. Test certificates only; no services contacted.
+
+=== baseline ===
+  [PASS-STATIC] C1: task_serializer == 'auth' (tasks are signed)
+  [PASS-STATIC] C1: accept_content == ['auth'] (unsigned task content types refused)
+  [PASS-STATIC] C1: security_key exists (issuer-allowed.key)
+  [PASS-STATIC] C1: security_certificate exists (issuer-allowed.crt)
+  [PASS-STATIC] C1: security_cert_store glob matches 1 file(s)
+  [PASS-STATIC] C1: allowed issuer certificate is present in the trust store
+  [RUNTIME-ONLY] C1: signature acceptance/rejection over the transport is proven by runtime_checks.py, not inferable from file presence
+  [RUNTIME-ONLY] C1: certificate expiry, key/cert cryptographic match, and filesystem permissions are operational checks, not settled here
+  [PASS-STATIC] C2: result_serializer == 'json' (results are written as JSON)
+  [PASS-STATIC] C2: result_accept_content == ['json'] (kombu loads() rejects other content types with ContentDisallowed)
+  [RUNTIME-ONLY] C2: the pickle-injection block is demonstrated by runtime_checks.py against cache+memory://
+  [RUNTIME-ONLY] C2: write access to the production result store must be restricted at the infrastructure layer; config cannot enforce that
+  [RUNTIME-ONLY] C3: no Celery setting authenticates events: runtime_checks.py shows a forged task-succeeded event being accepted by the event pipeline
+  [RUNTIME-ONLY] C3: application code must source completion from AsyncResult/result backend, never from event consumers
+
+=== task_only_counterexample ===
+  [PASS-STATIC] C1: task_serializer == 'auth' (tasks are signed)
+  [PASS-STATIC] C1: accept_content == ['auth'] (unsigned task content types refused)
+  [PASS-STATIC] C1: security_key exists (issuer-allowed.key)
+  [PASS-STATIC] C1: security_certificate exists (issuer-allowed.crt)
+  [PASS-STATIC] C1: security_cert_store glob matches 1 file(s)
+  [PASS-STATIC] C1: allowed issuer certificate is present in the trust store
+  [RUNTIME-ONLY] C1: signature acceptance/rejection over the transport is proven by runtime_checks.py, not inferable from file presence
+  [RUNTIME-ONLY] C1: certificate expiry, key/cert cryptographic match, and filesystem permissions are operational checks, not settled here
+  [PASS-STATIC] C2: result_serializer == 'json' (results are written as JSON)
+  [VIOLATION] C2: result_accept_content = None; no explicit JSON read gate. task_serializer=auth does not protect the result path
+  [RUNTIME-ONLY] C2: the pickle-injection block is demonstrated by runtime_checks.py against cache+memory://
+  [RUNTIME-ONLY] C2: write access to the production result store must be restricted at the infrastructure layer; config cannot enforce that
+  [RUNTIME-ONLY] C3: no Celery setting authenticates events: runtime_checks.py shows a forged task-succeeded event being accepted by the event pipeline
+  [RUNTIME-ONLY] C3: application code must source completion from AsyncResult/result backend, never from event consumers
+
+=== incomplete_trust_counterexample ===
+  [PASS-STATIC] C1: task_serializer == 'auth' (tasks are signed)
+  [PASS-STATIC] C1: accept_content == ['auth'] (unsigned task content types refused)
+  [PASS-STATIC] C1: security_key exists (issuer-allowed.key)
+  [PASS-STATIC] C1: security_certificate exists (issuer-allowed.crt)
+  [VIOLATION] C1: security_cert_store = 'certs/empty-store/*.pem' matches no certificates; FSCertStore will trust nobody
+  [VIOLATION] C1: allowed issuer certificate is NOT in the trust store; every signed task fails verification (fail-closed)
+  [RUNTIME-ONLY] C1: signature acceptance/rejection over the transport is proven by runtime_checks.py, not inferable from file presence
+  [RUNTIME-ONLY] C1: certificate expiry, key/cert cryptographic match, and filesystem permissions are operational checks, not settled here
+  [PASS-STATIC] C2: result_serializer == 'json' (results are written as JSON)
+  [PASS-STATIC] C2: result_accept_content == ['json'] (kombu loads() rejects other content types with ContentDisallowed)
+  [RUNTIME-ONLY] C2: the pickle-injection block is demonstrated by runtime_checks.py against cache+memory://
+  [RUNTIME-ONLY] C2: write access to the production result store must be restricted at the infrastructure layer; config cannot enforce that
+  [RUNTIME-ONLY] C3: no Celery setting authenticates events: runtime_checks.py shows a forged task-succeeded event being accepted by the event pipeline
+  [RUNTIME-ONLY] C3: application code must source completion from AsyncResult/result backend, never from event consumers
+
+=== summary ===
+  baseline: 0 violation(s), 6 runtime-only item(s), 8 static pass(es)
+  task_only_counterexample: 1 violation(s), 6 runtime-only item(s), 7 static pass(es)
+  incomplete_trust_counterexample: 2 violation(s), 6 runtime-only item(s), 6 static pass(es)
+
+NOTE: a violation-free static report is necessary, not sufficient. Run runtime_checks.py and review the operational items before claiming the deployment is secure.
